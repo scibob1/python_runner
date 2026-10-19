@@ -79,7 +79,68 @@ def _ensure_site_packages():
         os.makedirs(site_dir, exist_ok=True)
     if site_dir not in sys.path:
         sys.path.insert(0, site_dir)
+    try:
+        _preload_native_libs(site_dir)
+    except Exception:
+        pass
     return site_dir
+
+
+_CHAQUOPY_INDEX = "https://chaquo.com/pypi-13.1"
+_LOADED_NATIVE_LIBS = set()
+
+
+def _android_native_tags():
+    """PEP 425 tags of Chaquopy's Android wheels (e.g. cp311-cp311-android_21_arm64_v8a)."""
+    from pip._vendor.packaging.tags import Tag
+    import platform
+    machine = (platform.machine() or "").lower()
+    abi = {
+        "aarch64": "arm64_v8a", "arm64": "arm64_v8a",
+        "armv7l": "armeabi_v7a", "armv8l": "armeabi_v7a",
+        "x86_64": "x86_64", "i686": "x86", "i386": "x86",
+    }.get(machine)
+    if not abi:
+        return []
+    py = "cp%d%d" % (sys.version_info[0], sys.version_info[1])
+    plats = ["android_%d_%s" % (api, abi) for api in range(36, 20, -1)]
+    tags = []
+    for plat in plats:
+        tags.append(Tag(py, py, plat))
+    for plat in plats:
+        tags.append(Tag(py, "abi3", plat))
+    for plat in plats:
+        tags.append(Tag("py%d" % sys.version_info[0], "none", plat))
+        tags.append(Tag("py%d%d" % (sys.version_info[0], sys.version_info[1]), "none", plat))
+    return tags
+
+
+def _preload_native_libs(site_dir):
+    """dlopen shared libs shipped by wheels (chaquopy-openblas, libcxx, ...).
+
+    Build-time Chaquopy puts them in jniLibs; pip-installed ones live in
+    <site_dir>/chaquopy/lib and are not on the loader path, so load them by
+    absolute path (RTLD_GLOBAL) before importing numpy/scipy & co.
+    """
+    import ctypes
+    import glob
+    libdir = os.path.join(site_dir, "chaquopy", "lib")
+    if not os.path.isdir(libdir):
+        return
+    pending = [f for f in sorted(glob.glob(os.path.join(libdir, "*.so*")))
+               if f not in _LOADED_NATIVE_LIBS]
+    progress = True
+    while pending and progress:
+        progress = False
+        still = []
+        for path in pending:
+            try:
+                ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+                _LOADED_NATIVE_LIBS.add(path)
+                progress = True
+            except OSError:
+                still.append(path)  # dependency not loaded yet; retry
+        pending = still
 
 
 _PIP_PATCHED = False
@@ -127,6 +188,24 @@ def _patch_pip_for_chaquopy():
                 return _fallback_ua
 
         _session_module.user_agent = _safe_user_agent
+    except Exception:
+        pass
+    # (c) Accept Chaquopy's Android wheels if pip's own tag list lacks them.
+    try:
+        import pip._internal.models.target_python as _tp
+        _orig_get_supported = _tp.get_supported
+
+        def _get_supported(*a, **kw):
+            tags = _orig_get_supported(*a, **kw)
+            try:
+                if kw.get("platforms") is None and not any(
+                        "android" in t.platform for t in tags):
+                    tags = _android_native_tags() + list(tags)
+            except Exception:
+                pass
+            return tags
+
+        _tp.get_supported = _get_supported
     except Exception:
         pass
     _PIP_PATCHED = True
@@ -888,8 +967,20 @@ def install_package(args):
         return {e for e in os.listdir(site_dir) if e.endswith(('.dist-info', '.egg-info'))}
     before = _snap()
 
-    full_args = list(args) + ["--target", site_dir]
+    full_args = list(args)
+    if full_args and full_args[0] == "install":
+        # C-extension packages (numpy/scipy/...) only exist as Android wheels on
+        # Chaquopy's index; prefer them over newer source-only releases on PyPI.
+        if not any("chaquo.com" in str(a) for a in full_args):
+            full_args += ["--extra-index-url", _CHAQUOPY_INDEX]
+        if "--prefer-binary" not in full_args:
+            full_args.append("--prefer-binary")
+    full_args += ["--target", site_dir]
     pip_result = pip.main(full_args)
+    try:
+        _preload_native_libs(site_dir)
+    except Exception:
+        pass
     if pip_result != 0:
         return pip_result
 
