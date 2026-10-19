@@ -39,5 +39,14 @@ class PipPatchTest(unittest.TestCase):
             envs._DistributionFinder.find = original
 
 
+class AndroidTagsTest(unittest.TestCase):
+    def test_android_wheels_are_preferred_tags(self):
+        import script_runner as sr
+        tags = sr._android_native_tags()
+        self.assertTrue(tags)
+        py = "cp%d%d" % sys.version_info[:2]
+        self.assertTrue(any(t.interpreter == py and t.platform.startswith("android_21_") for t in tags))
+
+
 if __name__ == "__main__":
     unittest.main()
