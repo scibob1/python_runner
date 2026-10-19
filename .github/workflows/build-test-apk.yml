@@ -34,6 +34,21 @@ jobs:
           channel: stable
           flutter-version: '3.47.6'
 
+      - name: Install Android NDK (with retries)
+        run: |
+          NDK=28.2.13676358
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          for i in 1 2 3 4 5; do
+            rm -rf "$ANDROID_HOME/ndk/$NDK" "$ANDROID_HOME/.temp"
+            if yes | "$SDKM" --install "ndk;$NDK"; then
+              if [ -f "$ANDROID_HOME/ndk/$NDK/source.properties" ]; then
+                echo "NDK $NDK installed"; exit 0
+              fi
+            fi
+            echo "NDK install attempt $i failed, retrying..."; sleep $((i*10))
+          done
+          echo "NDK install failed after retries"; exit 1
+
       - name: Use Python ${{ matrix.python }} in the Chaquopy build (CI only)
         run: sed -i 's/version "3.11"/version "${{ matrix.python }}"/' android/app/build.gradle
 
@@ -58,7 +73,8 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Build release APK
-        run: flutter build apk --release
+        run: |
+          flutter build apk --release || { echo "Build failed, retrying once..."; flutter build apk --release; }
 
       - uses: actions/upload-artifact@v4
         with:
