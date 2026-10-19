@@ -234,6 +234,128 @@ def _run_install_with_fallback(full_args):
     return rc
 
 
+# soname -> Chaquopy wheel that ships it (best effort; wheels not listing them as dependencies)
+_NATIVE_PROVIDERS = {
+    "libomp.so": "chaquopy-libomp",
+    "libc++_shared.so": "chaquopy-libcxx",
+    "libgfortran.so": "chaquopy-libgfortran",
+    "libopenblas.so": "chaquopy-openblas",
+    "libjpeg.so": "chaquopy-libjpeg",
+    "libpng16.so": "chaquopy-libpng",
+    "libfreetype.so": "chaquopy-freetype",
+    "libxml2.so": "chaquopy-libxml2",
+    "libxslt.so": "chaquopy-libxslt",
+    "libexslt.so": "chaquopy-libxslt",
+    "libiconv.so": "chaquopy-libiconv",
+}
+
+
+def _elf_needed(path):
+    """DT_NEEDED sonames of an ELF64 little-endian shared object ([] on any problem)."""
+    import struct
+    try:
+        with open(path, "rb") as f:
+            h = f.read(64)
+            if len(h) < 64 or h[:4] != b"\x7fELF" or h[4] != 2 or h[5] != 1:
+                return []
+            e_phoff, = struct.unpack_from("<Q", h, 32)
+            e_phentsize, e_phnum = struct.unpack_from("<HH", h, 54)
+            f.seek(e_phoff)
+            ph = f.read(e_phentsize * e_phnum)
+            loads, dyn = [], None
+            for i in range(e_phnum):
+                p_type, _fl, p_off, p_va, _pa, p_fsz, _msz, _al = struct.unpack_from(
+                    "<IIQQQQQQ", ph, i * e_phentsize)
+                if p_type == 1:
+                    loads.append((p_va, p_off, p_fsz))
+                elif p_type == 2:
+                    dyn = (p_off, p_fsz)
+            if not dyn:
+                return []
+            f.seek(dyn[0])
+            d = f.read(dyn[1])
+            needed, strtab = [], None
+            for off in range(0, len(d) - 15, 16):
+                tag, val = struct.unpack_from("<qQ", d, off)
+                if tag == 0:
+                    break
+                if tag == 1:
+                    needed.append(val)
+                elif tag == 5:
+                    strtab = val
+            if strtab is None:
+                return []
+            base = None
+            for va, po, fsz in loads:
+                if va <= strtab < va + fsz:
+                    base = po + strtab - va
+                    break
+            if base is None:
+                return []
+            names = []
+            for n in needed:
+                f.seek(base + n)
+                names.append(f.read(128).split(b"\0", 1)[0].decode("ascii", "ignore"))
+            return names
+    except Exception:
+        return []
+
+
+def _find_missing_native_deps(site_dir):
+    """Known Chaquopy providers whose libs are needed by installed .so files but absent."""
+    have = set()
+    libdir = os.path.join(site_dir, "chaquopy", "lib")
+    if os.path.isdir(libdir):
+        have.update(os.listdir(libdir))
+    wanted = set()
+    for root, _dirs, files in os.walk(site_dir):
+        if os.path.normpath(root) == os.path.normpath(libdir):
+            continue
+        for name in files:
+            if ".so" in name:
+                for need in _elf_needed(os.path.join(root, name)):
+                    if need in _NATIVE_PROVIDERS:
+                        wanted.add(need)
+    return sorted(need for need in wanted if need not in have)
+
+
+def _install_native_provider(package, site_dir):
+    """Install a provider wheel into a temp dir and merge it into site_dir.
+
+    pip --target skips top-level dirs that already exist (e.g. the shared
+    'chaquopy/' dir), so merge the files ourselves.
+    """
+    import shutil
+    import tempfile
+    global _LAST_PIP_OUTPUT
+    saved = _LAST_PIP_OUTPUT
+    tmp = tempfile.mkdtemp(prefix="pipdep_", dir=os.path.dirname(site_dir))
+    try:
+        args = ["install", package, "--no-deps", "--prefer-binary", "--only-binary=:all:"]
+        for index in _CHAQUOPY_INDEXES:
+            args += ["--extra-index-url", index]
+        args += ["--target", tmp]
+        if _run_pip(args) != 0:
+            return False
+        for root, _dirs, files in os.walk(tmp):
+            rel = os.path.relpath(root, tmp)
+            dest_dir = site_dir if rel == "." else os.path.join(site_dir, rel)
+            os.makedirs(dest_dir, exist_ok=True)
+            for name in files:
+                shutil.copy2(os.path.join(root, name), os.path.join(dest_dir, name))
+        return True
+    except Exception:
+        return False
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        _LAST_PIP_OUTPUT = saved
+
+
+def _fix_missing_native_deps(site_dir):
+    for soname in _find_missing_native_deps(site_dir):
+        _install_native_provider(_NATIVE_PROVIDERS[soname], site_dir)
+
+
 _PIP_PATCHED = False
 
 
@@ -1069,6 +1191,11 @@ def install_package(args):
             full_args.append("--prefer-binary")
     full_args += ["--target", site_dir]
     pip_result = _run_install_with_fallback(full_args)
+    if pip_result == 0:
+        try:
+            _fix_missing_native_deps(site_dir)
+        except Exception:
+            pass
     try:
         _preload_native_libs(site_dir)
     except Exception:
