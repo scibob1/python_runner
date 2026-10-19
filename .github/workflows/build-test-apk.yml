@@ -50,7 +50,13 @@ jobs:
           echo "NDK install failed after retries"; exit 1
 
       - name: Use Python ${{ matrix.python }} in the Chaquopy build (CI only)
-        run: sed -i 's/version "3.11"/version "${{ matrix.python }}"/' android/app/build.gradle
+        run: |
+          sed -i 's/version "3.11"/version "${{ matrix.python }}"/' android/app/build.gradle
+          # Chaquopy's Python 3.13+ has no armeabi-v7a build: keep 64-bit ABIs only
+          if [ "${{ matrix.python }}" = "3.13" ]; then
+            sed -i 's/abiFilters "arm64-v8a", "armeabi-v7a"/abiFilters "arm64-v8a"/' android/app/build.gradle
+            grep -n abiFilters android/app/build.gradle
+          fi
 
       - run: flutter pub get
 
@@ -74,7 +80,9 @@ jobs:
 
       - name: Build release APK
         run: |
-          flutter build apk --release || { echo "Build failed, retrying once..."; flutter build apk --release; }
+          EXTRA=""
+          if [ "${{ matrix.python }}" = "3.13" ]; then EXTRA="--target-platform android-arm64"; fi
+          flutter build apk --release $EXTRA || { echo "Build failed, retrying once..."; flutter build apk --release $EXTRA; }
 
       - uses: actions/upload-artifact@v4
         with:
