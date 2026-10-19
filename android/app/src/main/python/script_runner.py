@@ -86,7 +86,10 @@ def _ensure_site_packages():
     return site_dir
 
 
-_CHAQUOPY_INDEX = "https://chaquo.com/pypi-13.1"
+_CHAQUOPY_INDEXES = (
+    "https://chaquo.com/pypi-13.1",       # official Android wheels
+    "https://chaquo.com/pypi-upstream/",  # maintainer's unofficial wheels (e.g. SciPy, Python 3.13)
+)
 _LOADED_NATIVE_LIBS = set()
 
 
@@ -188,10 +191,47 @@ def _run_pip(full_args):
 
 def last_pip_error(max_lines=12):
     """Short human-readable reason for the last failed pip run."""
+    if _LAST_PIP_OUTPUT.startswith("该包没有适用于"):
+        head, _, tail = _LAST_PIP_OUTPUT.partition("\n可改用")
+        hint = head + "\n可改用" + tail.split("\n", 1)[0]
+        return hint[-1500:]
     lines = [l.strip() for l in _LAST_PIP_OUTPUT.splitlines() if l.strip()]
     errs = [l for l in lines if "ERROR" in l or "Error" in l or "error:" in l]
     picked = (errs or lines)[-max_lines:]
     return "\n".join(picked)[-1500:]
+
+
+_NATIVE_HINT = (
+    "该包没有适用于 Python %d.%d / Android 的预编译版本，且手机上无法编译源码。\n"
+    "Chaquopy 官方仓库的 scipy / scikit-learn 只有 Python 3.8-3.10 的旧版本；"
+    "TensorFlow / PyTorch 没有 Android 版。\n"
+    "可改用 Linux-like 运行时安装，或使用 Python 3.10 / 3.13 版本的构建。"
+)
+
+
+def _run_install_with_fallback(full_args):
+    """Binary-only first (clear, fast failure for native packages), then sdists.
+
+    Pure-Python packages that only ship an sdist still work through the retry.
+    """
+    global _LAST_PIP_OUTPUT
+    if not full_args or full_args[0] != "install" or any(
+            a in ("--no-binary", "--only-binary") or str(a).startswith(("--no-binary=", "--only-binary="))
+            for a in full_args):
+        return _run_pip(full_args)
+    rc = _run_pip(full_args + ["--only-binary=:all:"])
+    if rc == 0:
+        return 0
+    first = _LAST_PIP_OUTPUT
+    if "No matching distribution" not in first and "Could not find a version" not in first:
+        return rc  # failed for another reason (network, permissions, ...): keep that message
+    rc = _run_pip(full_args)
+    if rc != 0:
+        out = _LAST_PIP_OUTPUT
+        if "build dependencies" in out or "Failed to build" in out or "No matching distribution" in out:
+            _LAST_PIP_OUTPUT = (_NATIVE_HINT % (sys.version_info[0], sys.version_info[1])
+                                + "\n" + out)
+    return rc
 
 
 _PIP_PATCHED = False
@@ -1022,12 +1062,13 @@ def install_package(args):
     if full_args and full_args[0] == "install":
         # C-extension packages (numpy/scipy/...) only exist as Android wheels on
         # Chaquopy's index; prefer them over newer source-only releases on PyPI.
-        if not any("chaquo.com" in str(a) for a in full_args):
-            full_args += ["--extra-index-url", _CHAQUOPY_INDEX]
+        for _index in _CHAQUOPY_INDEXES:
+            if not any(_index.rstrip("/") in str(a) for a in full_args):
+                full_args += ["--extra-index-url", _index]
         if "--prefer-binary" not in full_args:
             full_args.append("--prefer-binary")
     full_args += ["--target", site_dir]
-    pip_result = _run_pip(full_args)
+    pip_result = _run_install_with_fallback(full_args)
     try:
         _preload_native_libs(site_dir)
     except Exception:
