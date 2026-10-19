@@ -55,6 +55,8 @@ jobs:
           # Chaquopy's Python 3.13+ has no armeabi-v7a build: keep 64-bit ABIs only
           if [ "${{ matrix.python }}" = "3.13" ]; then
             sed -i 's/abiFilters "arm64-v8a", "armeabi-v7a"/abiFilters "arm64-v8a"/' android/app/build.gradle
+            # Flutter's Gradle plugin otherwise resets abiFilters to include armeabi-v7a
+            echo "disable-abi-filtering=true" >> android/gradle.properties
             grep -n abiFilters android/app/build.gradle
           fi
 
