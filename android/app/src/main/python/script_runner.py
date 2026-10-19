@@ -143,6 +143,57 @@ def _preload_native_libs(site_dir):
         pending = still
 
 
+_LAST_PIP_OUTPUT = ""
+
+
+class _Tee:
+    """Mirror writes to the real stream while keeping a copy for error reporting."""
+
+    def __init__(self, real, buf):
+        self._real, self._buf = real, buf
+
+    def write(self, text):
+        try:
+            self._buf.append(text)
+        except Exception:
+            pass
+        if self._real is not None:
+            return self._real.write(text)
+        return len(text)
+
+    def flush(self):
+        if self._real is not None:
+            try:
+                self._real.flush()
+            except Exception:
+                pass
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def _run_pip(full_args):
+    """pip.main() that also remembers its output for last_pip_error()."""
+    global _LAST_PIP_OUTPUT
+    import pip
+    buf = []
+    old_out, old_err = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = _Tee(old_out, buf), _Tee(old_err, buf)
+    try:
+        return pip.main(full_args)
+    finally:
+        sys.stdout, sys.stderr = old_out, old_err
+        _LAST_PIP_OUTPUT = "".join(buf)
+
+
+def last_pip_error(max_lines=12):
+    """Short human-readable reason for the last failed pip run."""
+    lines = [l.strip() for l in _LAST_PIP_OUTPUT.splitlines() if l.strip()]
+    errs = [l for l in lines if "ERROR" in l or "Error" in l or "error:" in l]
+    picked = (errs or lines)[-max_lines:]
+    return "\n".join(picked)[-1500:]
+
+
 _PIP_PATCHED = False
 
 
@@ -976,7 +1027,7 @@ def install_package(args):
         if "--prefer-binary" not in full_args:
             full_args.append("--prefer-binary")
     full_args += ["--target", site_dir]
-    pip_result = pip.main(full_args)
+    pip_result = _run_pip(full_args)
     try:
         _preload_native_libs(site_dir)
     except Exception:
