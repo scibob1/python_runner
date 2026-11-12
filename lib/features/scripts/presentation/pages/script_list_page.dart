@@ -34,6 +34,7 @@ import '../../../files/presentation/pages/file_manager_page.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:intl/intl.dart';
 import '../../../../pages/app_file_picker_page.dart';
+import '../../../ssh/presentation/ssh_entry_button.dart';
 
 part 'script_list_actions.dart';
 part 'script_list_content.dart';
@@ -137,7 +138,7 @@ class _ScriptListPageState extends ConsumerState<ScriptListPage> {
 
   Widget _buildScriptTitleBadge(int count) {
     final colors = Theme.of(context).colorScheme;
-    return Row(
+    return FittedBox(fit: BoxFit.scaleDown, alignment: Alignment.centerLeft, child: Row(
       mainAxisSize: MainAxisSize.min,
       children: [
         const Text('Python',
@@ -160,7 +161,7 @@ class _ScriptListPageState extends ConsumerState<ScriptListPage> {
           ),
         ),
       ],
-    );
+    ));
   }
 
   Widget _buildScriptMenu() {
@@ -424,7 +425,6 @@ class _ScriptListPageState extends ConsumerState<ScriptListPage> {
                           title: TextField(
                             controller: _searchController,
                             autofocus: true,
-                            enableSuggestions: false,
                             autocorrect: false,
                             decoration: InputDecoration(
                               hintText: l10n.searchScriptsHint,
@@ -474,6 +474,7 @@ class _ScriptListPageState extends ConsumerState<ScriptListPage> {
                                 ),
                           actions: _activeGroupId == null
                               ? [
+                                  const SshEntryButton(),
                                   _buildScriptNameVisibilityButton(),
                                   _buildScriptMenu(),
                                 ]
