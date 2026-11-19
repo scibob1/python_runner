@@ -15,6 +15,8 @@ import java.nio.file.Files
 import java.nio.file.Paths
 import java.security.MessageDigest
 import java.util.Locale
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.zip.GZIPInputStream
 
 class LinuxLikeRuntimeManager(private val context: Context) {
@@ -246,6 +248,9 @@ class LinuxLikeRuntimeManager(private val context: Context) {
         repairCriticalExecutablePermissions()
         return getInfo().toMutableMap().apply {
             this["prepared"] = "true"
+            if (this["available"] == "true") {
+                putAll(runGuestSelfCheck(force = false))
+            }
         }
     }
 
@@ -287,6 +292,9 @@ class LinuxLikeRuntimeManager(private val context: Context) {
             getInfo().toMutableMap().apply {
                 this["installedFrom"] = selectedManifestUrl
                 this["message"] = this["message"] ?: "Debian runtime installed"
+                if (this["available"] == "true") {
+                    putAll(runGuestSelfCheck(force = true))
+                }
             }
         } finally {
             cleanupDownloadedArchive()
@@ -301,7 +309,8 @@ class LinuxLikeRuntimeManager(private val context: Context) {
     ): List<String> {
         return buildBaseCommand(
             resolveScriptWorkingDir(workingDir),
-            ensureWorkingDirExists = true
+            ensureWorkingDirExists = true,
+            environment = environment
         ).apply {
             addPythonLauncherWithHook(scriptPath, executionFilePath)
         }
@@ -313,7 +322,7 @@ class LinuxLikeRuntimeManager(private val context: Context) {
         workingDir: String? = null,
         environment: Map<String, String>? = null
     ): List<String> {
-        return buildBaseCommand(workingDir).apply {
+        return buildBaseCommand(workingDir, environment = environment).apply {
             addPythonLauncher()
             add("-m")
             add(moduleName)
@@ -323,9 +332,10 @@ class LinuxLikeRuntimeManager(private val context: Context) {
 
     fun buildPythonInlineCommand(
         code: String,
-        workingDir: String? = null
+        workingDir: String? = null,
+        environment: Map<String, String>? = null
     ): List<String> {
-        return buildBaseCommand(workingDir).apply {
+        return buildBaseCommand(workingDir, environment = environment).apply {
             addPythonLauncher()
             add("-c")
             add(code)
@@ -339,7 +349,8 @@ class LinuxLikeRuntimeManager(private val context: Context) {
 
     private fun buildBaseCommand(
         workingDir: String? = null,
-        ensureWorkingDirExists: Boolean = false
+        ensureWorkingDirExists: Boolean = false,
+        environment: Map<String, String>? = null
     ): MutableList<String> {
         ensureDirectories()
         repairCriticalExecutablePermissions()
@@ -372,7 +383,14 @@ class LinuxLikeRuntimeManager(private val context: Context) {
         }
         command.add("-w")
         command.add(resolvedWorkingDir)
+        // The guest must not inherit the host app environment (Chaquopy PYTHONPATH etc.):
+        // clear it with env -i and pass only the allow-list plus the caller's variables.
+        command.addAll(GuestEnvironment.envCommand(guestEnvironment(environment)))
         return command
+    }
+
+    internal fun guestEnvironment(environment: Map<String, String>?): Map<String, String> {
+        return GuestEnvironment.build(environment, userSitePackageGuestPaths)
     }
 
     private fun MutableList<String>.addPythonLauncher() {
@@ -470,12 +488,19 @@ class LinuxLikeRuntimeManager(private val context: Context) {
         }
     }
 
+    /**
+     * Prepares the environment of the *proot* process only. Everything the guest sees is
+     * decided by [guestEnvironment] and baked into the command (`/usr/bin/env -i ...`), so
+     * [environment] is accepted for source compatibility but is already part of the command.
+     * LD_LIBRARY_PATH and PROOT_* are set here and never reach the guest.
+     */
     fun applyHostEnvironment(
         target: MutableMap<String, String>,
-        environment: Map<String, String>? = null
+        @Suppress("UNUSED_PARAMETER") environment: Map<String, String>? = null
     ) {
         ensureDirectories()
         val executionTempDir = createProotTempDir()
+        GuestEnvironment.scrubHostEnvironment(target)
         val existingLdPath = target["LD_LIBRARY_PATH"]?.takeIf { it.isNotBlank() }
         val runtimeLibDir = File(prootSupportDir, "usr/lib").absolutePath
         target["LD_LIBRARY_PATH"] = listOf(
@@ -489,30 +514,87 @@ class LinuxLikeRuntimeManager(private val context: Context) {
         if (File(prootLoader32Path).isFile) {
             target["PROOT_LOADER_32"] = prootLoader32Path
         }
-        target["HOME"] = "/root"
-        target["USER"] = "root"
-        target["LOGNAME"] = "root"
-        target["SHELL"] = "/bin/sh"
-        target["TERM"] = "xterm-256color"
-        target["PATH"] =
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-        target["LANG"] = "C.UTF-8"
-        target["PIP_NO_INPUT"] = "1"
-        target["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
-        target["PIP_ROOT_USER_ACTION"] = "ignore"
-        environment?.forEach { (key, value) ->
-            target[key] = value
-        }
-        target["PYTHONDONTWRITEBYTECODE"] = "1"
-        val pycacheDir = File(executionTempDir, "pycache")
-        if (!pycacheDir.exists()) pycacheDir.mkdirs()
-        target["PYTHONPYCACHEPREFIX"] = pycacheDir.absolutePath
-        val existingPythonPath = target["PYTHONPATH"]?.takeIf { it.isNotBlank() }
-        target["PYTHONPATH"] = (userSitePackageGuestPaths + listOfNotNull(existingPythonPath))
-            .distinct()
-            .joinToString(":")
         target["PROOT_TMP_DIR"] = executionTempDir.absolutePath
         target["TMPDIR"] = executionTempDir.absolutePath
+    }
+
+    private val selfCheckDone = AtomicBoolean(false)
+
+    private val selfCheckLogFile: File
+        get() = File(File(runtimeDir, "logs"), "guest-selfcheck.log")
+
+    /**
+     * Runs `python3 -c "import sys,encodings;print(sys.version,sys.path)"` inside the guest
+     * with the same command/environment path as real executions, and records the result in
+     * Logcat (tag LinuxLike) and in [selfCheckLogFile]. With [force] = false it runs once
+     * per app process.
+     */
+    fun runGuestSelfCheck(force: Boolean = true): Map<String, String> {
+        if (!force && !selfCheckDone.compareAndSet(false, true)) {
+            return mapOf("selfCheck" to "skipped")
+        }
+        val code = "import sys,encodings;print(sys.version,sys.path)"
+        var exitCode = -1
+        var output = ""
+        var error: String? = null
+        var commandLine = ""
+        val outputFile = File.createTempFile("guest-selfcheck-", ".txt", context.cacheDir)
+        var tempDir: String? = null
+        try {
+            val command = buildPythonInlineCommand(code)
+            commandLine = command.joinToString(" ")
+            val builder = ProcessBuilder(command)
+            builder.redirectErrorStream(true)
+            applyHostEnvironment(builder.environment())
+            tempDir = builder.environment()["PROOT_TMP_DIR"]
+            builder.redirectOutput(outputFile)
+            val process = builder.start()
+            if (!process.waitFor(20, TimeUnit.SECONDS)) {
+                process.destroyForcibly()
+                process.waitFor()
+                error = "timeout after 20s"
+            } else {
+                exitCode = process.exitValue()
+            }
+            output = outputFile.readText().trim().takeLast(4000)
+        } catch (e: Exception) {
+            error = "${e.javaClass.simpleName}: ${e.message}"
+        } finally {
+            outputFile.delete()
+            cleanupExecutionTempDir(tempDir)
+        }
+        val ok = error == null && exitCode == 0
+        val summary = "guest self-check ${if (ok) "OK" else "FAILED"} exit=$exitCode" +
+            (error?.let { " error=$it" } ?: "")
+        if (ok) {
+            android.util.Log.i("LinuxLike", "$summary\n$output")
+        } else {
+            android.util.Log.w("LinuxLike", "$summary\n$output")
+        }
+        appendSelfCheckLog(summary, commandLine, output)
+        return mapOf(
+            "selfCheck" to if (ok) "ok" else "failed",
+            "selfCheckExitCode" to exitCode.toString(),
+            "selfCheckOutput" to output,
+            "selfCheckLog" to selfCheckLogFile.absolutePath
+        )
+    }
+
+    private fun appendSelfCheckLog(summary: String, commandLine: String, output: String) {
+        try {
+            val file = selfCheckLogFile
+            file.parentFile?.mkdirs()
+            if (file.length() > 64 * 1024) {
+                val tail = file.readText().takeLast(32 * 1024)
+                file.writeText(tail)
+            }
+            file.appendText(
+                "[${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(java.util.Date())}] $summary\n" +
+                    "command: $commandLine\n" +
+                    "output:\n$output\n\n"
+            )
+        } catch (_: Exception) {
+        }
     }
 
     fun cleanupExecutionTempDir(path: String?) {
