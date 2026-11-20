@@ -240,6 +240,7 @@ class LinuxLikeRuntimeManager(private val context: Context) {
             "architecture" to (Build.SUPPORTED_ABIS.firstOrNull() ?: Build.CPU_ABI ?: "unknown")
         ).apply {
             putAll(marker)
+            putAll(lastSelfCheck)
         }
     }
 
@@ -520,20 +521,36 @@ class LinuxLikeRuntimeManager(private val context: Context) {
 
     private val selfCheckDone = AtomicBoolean(false)
 
+    @Volatile
+    private var lastSelfCheck: Map<String, String> = emptyMap()
+
     private val selfCheckLogFile: File
         get() = File(File(runtimeDir, "logs"), "guest-selfcheck.log")
 
+    private class ProbeResult(
+        val name: String,
+        val ok: Boolean,
+        val exitCode: Int,
+        val output: String,
+        val error: String?,
+        val commandLine: String
+    ) {
+        val summary: String
+            get() = "probe[$name] ${if (ok) "OK" else "FAILED"} exit=$exitCode" +
+                (error?.let { " error=$it" } ?: "")
+    }
+
     /**
-     * Runs `python3 -c "import sys,encodings;print(sys.version,sys.path)"` inside the guest
-     * with the same command/environment path as real executions, and records the result in
-     * Logcat (tag LinuxLike) and in [selfCheckLogFile]. With [force] = false it runs once
-     * per app process.
+     * Runs one inline Python probe through the same command/environment path as real
+     * executions. [guestEnv] is merged into the guest environment; [hostEnv] is set on the
+     * proot process only (e.g. PROOT_NO_SECCOMP).
      */
-    fun runGuestSelfCheck(force: Boolean = true): Map<String, String> {
-        if (!force && !selfCheckDone.compareAndSet(false, true)) {
-            return mapOf("selfCheck" to "skipped")
-        }
-        val code = "import sys,encodings;print(sys.version,sys.path)"
+    private fun runProbe(
+        name: String,
+        code: String,
+        guestEnv: Map<String, String>?,
+        hostEnv: Map<String, String>
+    ): ProbeResult {
         var exitCode = -1
         var output = ""
         var error: String? = null
@@ -541,11 +558,12 @@ class LinuxLikeRuntimeManager(private val context: Context) {
         val outputFile = File.createTempFile("guest-selfcheck-", ".txt", context.cacheDir)
         var tempDir: String? = null
         try {
-            val command = buildPythonInlineCommand(code)
+            val command = buildPythonInlineCommand(code, environment = guestEnv)
             commandLine = command.joinToString(" ")
             val builder = ProcessBuilder(command)
             builder.redirectErrorStream(true)
             applyHostEnvironment(builder.environment())
+            builder.environment().putAll(hostEnv)
             tempDir = builder.environment()["PROOT_TMP_DIR"]
             builder.redirectOutput(outputFile)
             val process = builder.start()
@@ -563,24 +581,67 @@ class LinuxLikeRuntimeManager(private val context: Context) {
             outputFile.delete()
             cleanupExecutionTempDir(tempDir)
         }
-        val ok = error == null && exitCode == 0
-        val summary = "guest self-check ${if (ok) "OK" else "FAILED"} exit=$exitCode" +
-            (error?.let { " error=$it" } ?: "")
-        if (ok) {
-            android.util.Log.i("LinuxLike", "$summary\n$output")
-        } else {
-            android.util.Log.w("LinuxLike", "$summary\n$output")
-        }
-        appendSelfCheckLog(summary, commandLine, output)
-        return mapOf(
-            "selfCheck" to if (ok) "ok" else "failed",
-            "selfCheckExitCode" to exitCode.toString(),
-            "selfCheckOutput" to output,
-            "selfCheckLog" to selfCheckLogFile.absolutePath
-        )
+        return ProbeResult(name, error == null && exitCode == 0, exitCode, output, error, commandLine)
     }
 
-    private fun appendSelfCheckLog(summary: String, commandLine: String, output: String) {
+    /**
+     * Guest self-check. First probe is `python3 -c "import sys,encodings;print(sys.version,sys.path)"`
+     * exactly as real runs do it. If it fails, extra diagnostic probes run so one attempt
+     * collects the data needed to tell causes apart:
+     *  - no-seccomp: same code with PROOT_NO_SECCOMP=1 on the proot process
+     *  - safe-path: PYTHONSAFEPATH=1 (no '' in sys.path, so no getcwd during import) and prints os.getcwd()
+     *  - safe-path+no-seccomp: both
+     * Results go to Logcat (tag LinuxLike), [selfCheckLogFile] and the getInfo() map
+     * (selfCheck*, selfCheckProbes, selfCheckProbe_*). With [force] = false it runs once per process.
+     */
+    fun runGuestSelfCheck(force: Boolean = true): Map<String, String> {
+        if (!force && !selfCheckDone.compareAndSet(false, true)) {
+            return mapOf("selfCheck" to "skipped")
+        }
+        val code = "import sys,encodings;print(sys.version,sys.path)"
+        val diagCode = "import sys,os\n" +
+            "print(sys.version)\n" +
+            "try:\n" +
+            "    print('getcwd', os.getcwd())\n" +
+            "except Exception as e:\n" +
+            "    print('getcwd failed', repr(e))\n" +
+            "print(sys.path)"
+        val probes = mutableListOf(runProbe("default", code, null, emptyMap()))
+        if (!probes[0].ok) {
+            val noSeccomp = mapOf("PROOT_NO_SECCOMP" to "1")
+            val safePath = mapOf("PYTHONSAFEPATH" to "1")
+            probes += runProbe("no-seccomp", code, null, noSeccomp)
+            probes += runProbe("safe-path", diagCode, safePath, emptyMap())
+            probes += runProbe("safe-path+no-seccomp", diagCode, safePath, noSeccomp)
+        }
+        probes.forEach { probe ->
+            if (probe.ok) {
+                android.util.Log.i("LinuxLike", "${probe.summary}\n${probe.output}")
+            } else {
+                android.util.Log.w("LinuxLike", "${probe.summary}\n${probe.output}")
+            }
+        }
+        appendSelfCheckLog(probes)
+        val first = probes[0]
+        val result = linkedMapOf(
+            "selfCheck" to if (first.ok) "ok" else "failed",
+            "selfCheckExitCode" to first.exitCode.toString(),
+            "selfCheckOutput" to first.output,
+            "selfCheckLog" to selfCheckLogFile.absolutePath,
+            "selfCheckProbes" to probes.joinToString("; ") {
+                "${it.name}=${if (it.ok) "ok" else "failed"}"
+            }
+        )
+        probes.drop(1).forEach { probe ->
+            result["selfCheckProbe_${probe.name.replace('+', '_').replace('-', '_')}"] =
+                "exit=${probe.exitCode}" + (probe.error?.let { " error=$it" } ?: "") +
+                    "\n" + probe.output.takeLast(1500)
+        }
+        lastSelfCheck = result
+        return result
+    }
+
+    private fun appendSelfCheckLog(probes: List<ProbeResult>) {
         try {
             val file = selfCheckLogFile
             file.parentFile?.mkdirs()
@@ -588,11 +649,15 @@ class LinuxLikeRuntimeManager(private val context: Context) {
                 val tail = file.readText().takeLast(32 * 1024)
                 file.writeText(tail)
             }
-            file.appendText(
-                "[${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(java.util.Date())}] $summary\n" +
-                    "command: $commandLine\n" +
-                    "output:\n$output\n\n"
-            )
+            val stamp = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+                .format(java.util.Date())
+            file.appendText(buildString {
+                probes.forEach { probe ->
+                    append("[$stamp] ${probe.summary}\n")
+                    append("command: ${probe.commandLine}\n")
+                    append("output:\n${probe.output}\n\n")
+                }
+            })
         } catch (_: Exception) {
         }
     }
