@@ -31,6 +31,10 @@ class ScriptExecutionController(
         private const val MAX_CAPTURED_OUTPUT_CHARS = 256 * 1024
     }
 
+    // TEMP-DIAG (remove after the getcwd/ENOSYS investigation): report the guest self-check
+    // probes into the script console once per app process, right after a failed Debian run.
+    private val tempDiagReported = AtomicBoolean(false)
+
     private class BoundedOutputBuffer(private val maxChars: Int) {
         private val content = StringBuilder()
         private var truncated = false
@@ -515,6 +519,22 @@ class ScriptExecutionController(
                         "Debian process exited with code $exitCode",
                         "stdout:\n${stdout.tail(4000)}\n\nstderr:\n${stderr.tail(4000)}"
                     )
+                }
+                // TEMP-DIAG (remove): print the guest self-check probes into the console.
+                if (status == "error" && tempDiagReported.compareAndSet(false, true)) {
+                    try {
+                        sendLog("stderr", "[TEMP-DIAG] 正在运行 Debian 自检对照探针（可能需要几十秒）...", executionId)
+                        val diag = linuxLikeRuntimeManager.runGuestSelfCheck(force = true)
+                        diag.forEach { (key, value) ->
+                            if (key.startsWith("selfCheck") && key != "selfCheckLog") {
+                                value.lines().forEach { line ->
+                                    sendLog("stderr", "[TEMP-DIAG] $key: $line", executionId)
+                                }
+                            }
+                        }
+                    } catch (e: Throwable) {
+                        sendLog("stderr", "[TEMP-DIAG] 自检失败: ${e.javaClass.simpleName}: ${e.message}", executionId)
+                    }
                 }
             } catch (e: Throwable) {
                 sendLog("stderr", "Debian执行错误: ${e.message}", executionId)
