@@ -391,7 +391,12 @@ class LinuxLikeRuntimeManager(private val context: Context) {
     }
 
     internal fun guestEnvironment(environment: Map<String, String>?): Map<String, String> {
-        return GuestEnvironment.build(environment, userSitePackageGuestPaths)
+        // hooksDir first: it holds sitecustomize.py (getcwd ENOSYS retry), which `site`
+        // imports at interpreter start-up, before '' is added to sys.path.
+        return GuestEnvironment.build(
+            environment,
+            listOf(hooksDir.absolutePath) + userSitePackageGuestPaths
+        )
     }
 
     private fun MutableList<String>.addPythonLauncher() {
@@ -691,14 +696,17 @@ class LinuxLikeRuntimeManager(private val context: Context) {
 
     private fun prepareHooksDir() {
         hooksDir.mkdirs()
-        val hookFile = File(hooksDir, "http_debug_hook.py")
-        try {
-            context.assets.open("python_hooks/http_debug_hook.py").use { input ->
-                hookFile.outputStream().use { output -> input.copyTo(output) }
-            }
-            hookFile.setReadable(true, false)
-            hookFile.setWritable(true, true)
-        } catch (_: Exception) { }
+        // sitecustomize.py: getcwd ENOSYS retry, picked up through the guest PYTHONPATH.
+        listOf("http_debug_hook.py", "sitecustomize.py").forEach { fileName ->
+            val hookFile = File(hooksDir, fileName)
+            try {
+                context.assets.open("python_hooks/$fileName").use { input ->
+                    hookFile.outputStream().use { output -> input.copyTo(output) }
+                }
+                hookFile.setReadable(true, false)
+                hookFile.setWritable(true, true)
+            } catch (_: Exception) { }
+        }
     }
 
     private fun repairCriticalExecutablePermissions() {
