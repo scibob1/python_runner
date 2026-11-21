@@ -54,6 +54,12 @@ jobs:
       - name: Build debug APK
         run: flutter build apk --debug
 
+      # Only the app module: plugin modules (e.g. url_launcher_android) ship Robolectric
+      # tests that need Java 21 and are not ours to gate on.
+      - name: Android (Kotlin) unit tests
+        working-directory: android
+        run: ./gradlew :app:testDebugUnitTest --console=plain
+
       - name: Create CI release signing key
         run: |
           keytool -genkeypair \
