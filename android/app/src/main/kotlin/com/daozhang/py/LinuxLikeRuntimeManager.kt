@@ -54,9 +54,9 @@ class LinuxLikeRuntimeManager(private val context: Context) {
     private val dynamicLibraryGuestPath = "/usr/lib/aarch64-linux-gnu:/lib/aarch64-linux-gnu:/usr/lib:/lib"
 
     /**
-     * Compatibility mode = run proot with PROOT_NO_SECCOMP=1. The bundled proot (5.1.0, Termux
-     * build without upstream d4d2a19) makes getcwd/chdir/readlink fail with ENOSYS under seccomp
-     * acceleration on the HarmonyOS test device; without seccomp they work. Default on.
+     * Compatibility mode = run proot with PROOT_NO_SECCOMP=1. On the HarmonyOS test device
+     * getcwd/chdir/readlink fail with ENOSYS under proot's seccomp acceleration (bundled proot
+     * 5.1.0, and also the proot used by another app), while they work without it. Default on.
      */
     val prootCompatMode: Boolean
         get() = try {
@@ -401,6 +401,9 @@ class LinuxLikeRuntimeManager(private val context: Context) {
         listOf("/sdcard", "/storage", "/mnt").forEach { path ->
             if (File(path).exists()) addBind(command, path)
         }
+        // Host /proc: numpy/scipy/psutil read /proc/cpuinfo, /proc/self/* etc.; the rootfs
+        // has no usable /proc of its own ("Can't read /proc/cpuinfo", readlink /proc/self/exe ENOENT).
+        if (File("/proc").isDirectory) addBind(command, "/proc")
         if (resolvedWorkingDir.startsWith("/")) {
             val hostWorkingDir = File(resolvedWorkingDir)
             if (ensureWorkingDirExists && !hostWorkingDir.exists()) {
