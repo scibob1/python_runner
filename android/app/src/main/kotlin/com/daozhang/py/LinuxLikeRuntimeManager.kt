@@ -343,6 +343,17 @@ class LinuxLikeRuntimeManager(private val context: Context) {
         }
     }
 
+    /** Runs an arbitrary guest executable (e.g. `/bin/pwd -P`) through the same proot/env -i path. */
+    fun buildGuestExecCommand(
+        args: List<String>,
+        workingDir: String? = null,
+        environment: Map<String, String>? = null
+    ): List<String> {
+        return buildBaseCommand(workingDir, environment = environment).apply {
+            addAll(args)
+        }
+    }
+
     fun resolveScriptWorkingDir(workingDir: String?): String {
         val candidate = workingDir?.trim().orEmpty()
         return if (candidate.isNotEmpty()) candidate else defaultScriptWorkingDir
@@ -391,12 +402,7 @@ class LinuxLikeRuntimeManager(private val context: Context) {
     }
 
     internal fun guestEnvironment(environment: Map<String, String>?): Map<String, String> {
-        // hooksDir first: it holds sitecustomize.py (getcwd ENOSYS retry), which `site`
-        // imports at interpreter start-up, before '' is added to sys.path.
-        return GuestEnvironment.build(
-            environment,
-            listOf(hooksDir.absolutePath) + userSitePackageGuestPaths
-        )
+        return GuestEnvironment.build(environment, userSitePackageGuestPaths)
     }
 
     private fun MutableList<String>.addPythonLauncher() {
@@ -546,15 +552,14 @@ class LinuxLikeRuntimeManager(private val context: Context) {
     }
 
     /**
-     * Runs one inline Python probe through the same command/environment path as real
-     * executions. [guestEnv] is merged into the guest environment; [hostEnv] is set on the
-     * proot process only (e.g. PROOT_NO_SECCOMP).
+     * Runs one probe process. [buildCommand] produces the full command (proot + guest side),
+     * [hostEnv] is set on the proot process only (e.g. PROOT_NO_SECCOMP). Stdout and stderr
+     * are captured together.
      */
     private fun runProbe(
         name: String,
-        code: String,
-        guestEnv: Map<String, String>?,
-        hostEnv: Map<String, String>
+        hostEnv: Map<String, String>,
+        buildCommand: () -> List<String>
     ): ProbeResult {
         var exitCode = -1
         var output = ""
@@ -563,7 +568,7 @@ class LinuxLikeRuntimeManager(private val context: Context) {
         val outputFile = File.createTempFile("guest-selfcheck-", ".txt", context.cacheDir)
         var tempDir: String? = null
         try {
-            val command = buildPythonInlineCommand(code, environment = guestEnv)
+            val command = buildCommand()
             commandLine = command.joinToString(" ")
             val builder = ProcessBuilder(command)
             builder.redirectErrorStream(true)
@@ -590,35 +595,48 @@ class LinuxLikeRuntimeManager(private val context: Context) {
     }
 
     /**
-     * Guest self-check. First probe is `python3 -c "import sys,encodings;print(sys.version,sys.path)"`
-     * exactly as real runs do it. If it fails, extra diagnostic probes run so one attempt
-     * collects the data needed to tell causes apart:
-     *  - no-seccomp: same code with PROOT_NO_SECCOMP=1 on the proot process
-     *  - safe-path: PYTHONSAFEPATH=1 (no '' in sys.path, so no getcwd during import) and prints os.getcwd()
-     *  - safe-path+no-seccomp: both
-     * Results go to Logcat (tag LinuxLike), [selfCheckLogFile] and the getInfo() map
-     * (selfCheck*, selfCheckProbes, selfCheckProbe_*). With [force] = false it runs once per process.
+     * Guest self-check; every probe goes through the same proot/env -i path as real runs.
+     *  - proot-version: `proot --version` (which proot build is actually in use)
+     *  - import: `python3 -c "import sys,encodings;print(sys.version,sys.path)"` (the real failure)
+     *  - syscalls-default / syscalls-no-seccomp: Python with PYTHONSAFEPATH=1 (so the import
+     *    system does not call getcwd) that calls getcwd, chdir, readlink and stat one by one
+     *    and prints each result or error; once with default proot, once with PROOT_NO_SECCOMP=1
+     *  - pwd-default / pwd-no-seccomp: `/bin/pwd -P` (no Python involved), same two modes
+     * The first result key `selfCheck` reflects the `import` probe. Everything also lands in
+     * Logcat (tag LinuxLike), [selfCheckLogFile] and the getInfo() map (selfCheckProbes,
+     * selfCheckProbe_*). With [force] = false it runs once per app process.
      */
     fun runGuestSelfCheck(force: Boolean = true): Map<String, String> {
         if (!force && !selfCheckDone.compareAndSet(false, true)) {
             return mapOf("selfCheck" to "skipped")
         }
-        val code = "import sys,encodings;print(sys.version,sys.path)"
-        val diagCode = "import sys,os\n" +
-            "print(sys.version)\n" +
-            "try:\n" +
-            "    print('getcwd', os.getcwd())\n" +
-            "except Exception as e:\n" +
-            "    print('getcwd failed', repr(e))\n" +
-            "print(sys.path)"
-        val probes = mutableListOf(runProbe("default", code, null, emptyMap()))
-        if (!probes[0].ok) {
-            val noSeccomp = mapOf("PROOT_NO_SECCOMP" to "1")
-            val safePath = mapOf("PYTHONSAFEPATH" to "1")
-            probes += runProbe("no-seccomp", code, null, noSeccomp)
-            probes += runProbe("safe-path", diagCode, safePath, emptyMap())
-            probes += runProbe("safe-path+no-seccomp", diagCode, safePath, noSeccomp)
-        }
+        val importCode = "import sys,encodings;print(sys.version,sys.path)"
+        val syscallCode = "import os\n" +
+            "def t(name, fn):\n" +
+            "    try:\n" +
+            "        print(name, 'ok', repr(fn()))\n" +
+            "    except BaseException as e:\n" +
+            "        print(name, 'FAIL', repr(e))\n" +
+            "t('getcwd', os.getcwd)\n" +
+            "t('readlink /proc/self/cwd', lambda: os.readlink('/proc/self/cwd'))\n" +
+            "t('readlink /proc/self/exe', lambda: os.readlink('/proc/self/exe'))\n" +
+            "t('stat .', lambda: os.stat('.').st_ino)\n" +
+            "t('chdir /', lambda: os.chdir('/'))\n" +
+            "t('getcwd after chdir', os.getcwd)\n"
+        val safePath = mapOf("PYTHONSAFEPATH" to "1")
+        val noSeccomp = mapOf("PROOT_NO_SECCOMP" to "1")
+        val probes = listOf(
+            runProbe("proot-version", emptyMap()) { listOf(prootPath, "--version") },
+            runProbe("import", emptyMap()) { buildPythonInlineCommand(importCode) },
+            runProbe("syscalls-default", emptyMap()) {
+                buildPythonInlineCommand(syscallCode, environment = safePath)
+            },
+            runProbe("syscalls-no-seccomp", noSeccomp) {
+                buildPythonInlineCommand(syscallCode, environment = safePath)
+            },
+            runProbe("pwd-default", emptyMap()) { buildGuestExecCommand(listOf("/bin/pwd", "-P")) },
+            runProbe("pwd-no-seccomp", noSeccomp) { buildGuestExecCommand(listOf("/bin/pwd", "-P")) }
+        )
         probes.forEach { probe ->
             if (probe.ok) {
                 android.util.Log.i("LinuxLike", "${probe.summary}\n${probe.output}")
@@ -627,18 +645,18 @@ class LinuxLikeRuntimeManager(private val context: Context) {
             }
         }
         appendSelfCheckLog(probes)
-        val first = probes[0]
+        val import = probes.first { it.name == "import" }
         val result = linkedMapOf(
-            "selfCheck" to if (first.ok) "ok" else "failed",
-            "selfCheckExitCode" to first.exitCode.toString(),
-            "selfCheckOutput" to first.output,
+            "selfCheck" to if (import.ok) "ok" else "failed",
+            "selfCheckExitCode" to import.exitCode.toString(),
+            "selfCheckOutput" to import.output,
             "selfCheckLog" to selfCheckLogFile.absolutePath,
             "selfCheckProbes" to probes.joinToString("; ") {
                 "${it.name}=${if (it.ok) "ok" else "failed"}"
             }
         )
-        probes.drop(1).forEach { probe ->
-            result["selfCheckProbe_${probe.name.replace('+', '_').replace('-', '_')}"] =
+        probes.filter { it.name != "import" }.forEach { probe ->
+            result["selfCheckProbe_${probe.name.replace('-', '_')}"] =
                 "exit=${probe.exitCode}" + (probe.error?.let { " error=$it" } ?: "") +
                     "\n" + probe.output.takeLast(1500)
         }
@@ -696,17 +714,14 @@ class LinuxLikeRuntimeManager(private val context: Context) {
 
     private fun prepareHooksDir() {
         hooksDir.mkdirs()
-        // sitecustomize.py: getcwd ENOSYS retry, picked up through the guest PYTHONPATH.
-        listOf("http_debug_hook.py", "sitecustomize.py").forEach { fileName ->
-            val hookFile = File(hooksDir, fileName)
-            try {
-                context.assets.open("python_hooks/$fileName").use { input ->
-                    hookFile.outputStream().use { output -> input.copyTo(output) }
-                }
-                hookFile.setReadable(true, false)
-                hookFile.setWritable(true, true)
-            } catch (_: Exception) { }
-        }
+        val hookFile = File(hooksDir, "http_debug_hook.py")
+        try {
+            context.assets.open("python_hooks/http_debug_hook.py").use { input ->
+                hookFile.outputStream().use { output -> input.copyTo(output) }
+            }
+            hookFile.setReadable(true, false)
+            hookFile.setWritable(true, true)
+        } catch (_: Exception) { }
     }
 
     private fun repairCriticalExecutablePermissions() {
