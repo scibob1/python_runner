@@ -26,6 +26,9 @@ class LinuxLikeRuntimeManager(private val context: Context) {
         const val defaultRuntimeFlavor = "debian-python-dev-aarch64"
         const val stdinRequestSentinel = "__PYRUNNER_STDIN_REQUEST__"
         const val defaultScriptWorkingDir = "/storage/emulated/0/Download/PythonRunner"
+
+        /** SharedPreferences key (Flutter `shared_preferences` stores bool values under "flutter."). */
+        const val prootCompatModePrefKey = "flutter.debian_proot_compat_mode"
     }
 
     private val runtimeDir: File = File(context.filesDir, "linux_like")
@@ -49,6 +52,19 @@ class LinuxLikeRuntimeManager(private val context: Context) {
     private val fallbackDnsServers = listOf("1.1.1.1", "8.8.8.8")
     private val dynamicLoaderGuestPath = "/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"
     private val dynamicLibraryGuestPath = "/usr/lib/aarch64-linux-gnu:/lib/aarch64-linux-gnu:/usr/lib:/lib"
+
+    /**
+     * Compatibility mode = run proot with PROOT_NO_SECCOMP=1. The bundled proot (5.1.0, Termux
+     * build without upstream d4d2a19) makes getcwd/chdir/readlink fail with ENOSYS under seccomp
+     * acceleration on the HarmonyOS test device; without seccomp they work. Default on.
+     */
+    val prootCompatMode: Boolean
+        get() = try {
+            context.getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+                .getBoolean(prootCompatModePrefKey, true)
+        } catch (_: Exception) {
+            true
+        }
 
     val userSitePackageGuestPaths: List<String>
         get() = listOf(
@@ -221,6 +237,7 @@ class LinuxLikeRuntimeManager(private val context: Context) {
             "nativeLinuxLikeLoaderPath" to nativeLinuxLikeLoaderPath,
             "nativeLinuxLikeLoaderGuestPath" to nativeLinuxLikeLoaderGuestPath,
             "prootSource" to if (prootPath == nativeProotPath) "apk_native" else "runtime_package",
+            "prootCompatMode" to prootCompatMode.toString(),
             "pythonPath" to pythonPath,
             "pipPath" to pipPath,
             "archivePath" to archiveFile.absolutePath,
@@ -505,10 +522,13 @@ class LinuxLikeRuntimeManager(private val context: Context) {
      * decided by [guestEnvironment] and baked into the command (`/usr/bin/env -i ...`), so
      * [environment] is accepted for source compatibility but is already part of the command.
      * LD_LIBRARY_PATH and PROOT_* are set here and never reach the guest.
+     *
+     * [seccompCompat] = true sets PROOT_NO_SECCOMP=1 (see [prootCompatMode]); false removes it.
      */
     fun applyHostEnvironment(
         target: MutableMap<String, String>,
-        @Suppress("UNUSED_PARAMETER") environment: Map<String, String>? = null
+        @Suppress("UNUSED_PARAMETER") environment: Map<String, String>? = null,
+        seccompCompat: Boolean = prootCompatMode
     ) {
         ensureDirectories()
         val executionTempDir = createProotTempDir()
@@ -528,6 +548,11 @@ class LinuxLikeRuntimeManager(private val context: Context) {
         }
         target["PROOT_TMP_DIR"] = executionTempDir.absolutePath
         target["TMPDIR"] = executionTempDir.absolutePath
+        if (seccompCompat) {
+            target["PROOT_NO_SECCOMP"] = "1"
+        } else {
+            target.remove("PROOT_NO_SECCOMP")
+        }
     }
 
     private val selfCheckDone = AtomicBoolean(false)
@@ -552,13 +577,13 @@ class LinuxLikeRuntimeManager(private val context: Context) {
     }
 
     /**
-     * Runs one probe process. [buildCommand] produces the full command (proot + guest side),
-     * [hostEnv] is set on the proot process only (e.g. PROOT_NO_SECCOMP). Stdout and stderr
-     * are captured together.
+     * Runs one probe process. [buildCommand] produces the full command (proot + guest side);
+     * [seccompCompat] decides PROOT_NO_SECCOMP on the proot process. Stdout and stderr are
+     * captured together.
      */
     private fun runProbe(
         name: String,
-        hostEnv: Map<String, String>,
+        seccompCompat: Boolean,
         buildCommand: () -> List<String>
     ): ProbeResult {
         var exitCode = -1
@@ -572,8 +597,7 @@ class LinuxLikeRuntimeManager(private val context: Context) {
             commandLine = command.joinToString(" ")
             val builder = ProcessBuilder(command)
             builder.redirectErrorStream(true)
-            applyHostEnvironment(builder.environment())
-            builder.environment().putAll(hostEnv)
+            applyHostEnvironment(builder.environment(), null, seccompCompat)
             tempDir = builder.environment()["PROOT_TMP_DIR"]
             builder.redirectOutput(outputFile)
             val process = builder.start()
@@ -597,14 +621,15 @@ class LinuxLikeRuntimeManager(private val context: Context) {
     /**
      * Guest self-check; every probe goes through the same proot/env -i path as real runs.
      *  - proot-version: `proot --version` (which proot build is actually in use)
-     *  - import: `python3 -c "import sys,encodings;print(sys.version,sys.path)"` (the real failure)
-     *  - syscalls-default / syscalls-no-seccomp: Python with PYTHONSAFEPATH=1 (so the import
-     *    system does not call getcwd) that calls getcwd, chdir, readlink and stat one by one
-     *    and prints each result or error; once with default proot, once with PROOT_NO_SECCOMP=1
-     *  - pwd-default / pwd-no-seccomp: `/bin/pwd -P` (no Python involved), same two modes
-     * The first result key `selfCheck` reflects the `import` probe. Everything also lands in
-     * Logcat (tag LinuxLike), [selfCheckLogFile] and the getInfo() map (selfCheckProbes,
-     * selfCheckProbe_*). With [force] = false it runs once per app process.
+     *  - import: `python3 -c "import sys,encodings;print(sys.version,sys.path)"` with the
+     *    currently configured mode ([prootCompatMode]); this is the real-world check
+     *  - syscalls-seccomp / syscalls-compat: Python with PYTHONSAFEPATH=1 (so the import
+     *    system does not call getcwd) that calls getcwd, readlink, stat and chdir one by one
+     *    and prints each result or error; seccomp acceleration on vs. PROOT_NO_SECCOMP=1
+     *  - pwd-seccomp / pwd-compat: `/bin/pwd -P` (no Python involved), same two modes
+     * `selfCheck` reflects the `import` probe. Everything also lands in Logcat (tag LinuxLike),
+     * [selfCheckLogFile] and the getInfo() map (selfCheckProbes, selfCheckProbe_*).
+     * With [force] = false it runs once per app process.
      */
     fun runGuestSelfCheck(force: Boolean = true): Map<String, String> {
         if (!force && !selfCheckDone.compareAndSet(false, true)) {
@@ -624,18 +649,18 @@ class LinuxLikeRuntimeManager(private val context: Context) {
             "t('chdir /', lambda: os.chdir('/'))\n" +
             "t('getcwd after chdir', os.getcwd)\n"
         val safePath = mapOf("PYTHONSAFEPATH" to "1")
-        val noSeccomp = mapOf("PROOT_NO_SECCOMP" to "1")
+        val configuredCompat = prootCompatMode
         val probes = listOf(
-            runProbe("proot-version", emptyMap()) { listOf(prootPath, "--version") },
-            runProbe("import", emptyMap()) { buildPythonInlineCommand(importCode) },
-            runProbe("syscalls-default", emptyMap()) {
+            runProbe("proot-version", configuredCompat) { listOf(prootPath, "--version") },
+            runProbe("import", configuredCompat) { buildPythonInlineCommand(importCode) },
+            runProbe("syscalls-seccomp", false) {
                 buildPythonInlineCommand(syscallCode, environment = safePath)
             },
-            runProbe("syscalls-no-seccomp", noSeccomp) {
+            runProbe("syscalls-compat", true) {
                 buildPythonInlineCommand(syscallCode, environment = safePath)
             },
-            runProbe("pwd-default", emptyMap()) { buildGuestExecCommand(listOf("/bin/pwd", "-P")) },
-            runProbe("pwd-no-seccomp", noSeccomp) { buildGuestExecCommand(listOf("/bin/pwd", "-P")) }
+            runProbe("pwd-seccomp", false) { buildGuestExecCommand(listOf("/bin/pwd", "-P")) },
+            runProbe("pwd-compat", true) { buildGuestExecCommand(listOf("/bin/pwd", "-P")) }
         )
         probes.forEach { probe ->
             if (probe.ok) {
@@ -648,6 +673,7 @@ class LinuxLikeRuntimeManager(private val context: Context) {
         val import = probes.first { it.name == "import" }
         val result = linkedMapOf(
             "selfCheck" to if (import.ok) "ok" else "failed",
+            "selfCheckCompatMode" to configuredCompat.toString(),
             "selfCheckExitCode" to import.exitCode.toString(),
             "selfCheckOutput" to import.output,
             "selfCheckLog" to selfCheckLogFile.absolutePath,
