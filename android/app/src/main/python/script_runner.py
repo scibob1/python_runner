@@ -9,6 +9,8 @@ import queue as _queue_mod
 import gc
 import warnings
 
+import pip_staging
+
 
 _APP_DATA_DIR = None
 _DEFAULT_APP_DATA_DIR = "/data/data/com.daozhang.py"
@@ -319,35 +321,71 @@ def _find_missing_native_deps(site_dir):
 
 
 def _install_native_provider(package, site_dir):
-    """Install a provider wheel into a temp dir and merge it into site_dir.
+    """Install a provider wheel into a staging dir and merge it into site_dir.
 
     pip --target skips top-level dirs that already exist (e.g. the shared
-    'chaquopy/' dir), so merge the files ourselves.
+    'chaquopy/' dir), so the merge is done by pip_staging, which merges shared dirs
+    file by file and rolls everything back if the merge fails half-way.
     """
-    import shutil
-    import tempfile
     global _LAST_PIP_OUTPUT
     saved = _LAST_PIP_OUTPUT
-    tmp = tempfile.mkdtemp(prefix="pipdep_", dir=os.path.dirname(site_dir))
     try:
-        args = ["install", package, "--no-deps", "--prefer-binary", "--only-binary=:all:"]
-        for index in _CHAQUOPY_INDEXES:
-            args += ["--extra-index-url", index]
-        args += ["--target", tmp]
-        if _run_pip(args) != 0:
-            return False
-        for root, _dirs, files in os.walk(tmp):
-            rel = os.path.relpath(root, tmp)
-            dest_dir = site_dir if rel == "." else os.path.join(site_dir, rel)
-            os.makedirs(dest_dir, exist_ok=True)
-            for name in files:
-                shutil.copy2(os.path.join(root, name), os.path.join(dest_dir, name))
+        with pip_staging.staging_dir(site_dir) as staging:
+            args = ["install", package, "--no-deps", "--prefer-binary", "--only-binary=:all:"]
+            for index in _CHAQUOPY_INDEXES:
+                args += ["--extra-index-url", index]
+            args += ["--target", staging]
+            if _run_pip(args) != 0:
+                return False
+            pip_staging.merge_staging(staging, site_dir)
         return True
     except Exception:
         return False
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
         _LAST_PIP_OUTPUT = saved
+
+
+_UPGRADE_LONG_FLAGS = ("--upgrade", "--force-reinstall", "--ignore-installed")
+
+
+def _is_upgrade_request(args):
+    """True when the pip args ask to replace installed files (-U / -I / --force-reinstall).
+
+    Without such a flag an already installed package is left alone, like ``pip --target``.
+    ``--upgrade-strategy`` alone is not an upgrade request.
+    """
+    for arg in args:
+        arg = str(arg)
+        if arg in _UPGRADE_LONG_FLAGS:
+            return True
+        # short flags, possibly clustered (-U, -I, -Ur)
+        if re.match(r"^-[A-Za-z]+$", arg) and ("U" in arg or "I" in arg):
+            return True
+    return False
+
+
+def _install_via_staging(full_args, site_dir, upgrade):
+    """pip install into a fresh staging dir, then merge into site_dir (all or nothing).
+
+    A failed or interrupted pip run never touches site_dir, so it can no longer leave
+    half-installed packages behind that block the next install.
+    """
+    global _LAST_PIP_OUTPUT
+    with pip_staging.staging_dir(site_dir) as staging:
+        rc = _run_install_with_fallback(list(full_args) + ["--target", staging])
+        if rc != 0:
+            return rc
+        try:
+            result = pip_staging.merge_staging(staging, site_dir, upgrade=upgrade)
+        except Exception as exc:
+            message = "安装文件合并失败，已回滚，已安装的包未被改动: %s: %s" % (type(exc).__name__, exc)
+            print(message, file=sys.stderr)
+            _LAST_PIP_OUTPUT = message
+            return 1
+    kept = [n for n in result["skipped"] if not n.endswith((".dist-info", ".egg-info"))]
+    if kept:
+        print("提示: 以下已安装的项目未被替换（如需更新请加 --upgrade）: " + ", ".join(kept))
+    return 0
 
 
 def _fix_missing_native_deps(site_dir):
@@ -1180,7 +1218,8 @@ def install_package(args):
     before = _snap()
 
     full_args = list(args)
-    if full_args and full_args[0] == "install":
+    is_install = bool(full_args) and full_args[0] == "install"
+    if is_install:
         # C-extension packages (numpy/scipy/...) only exist as Android wheels on
         # Chaquopy's index; prefer them over newer source-only releases on PyPI.
         for _index in _CHAQUOPY_INDEXES:
@@ -1188,8 +1227,11 @@ def install_package(args):
                 full_args += ["--extra-index-url", _index]
         if "--prefer-binary" not in full_args:
             full_args.append("--prefer-binary")
-    full_args += ["--target", site_dir]
-    pip_result = _run_install_with_fallback(full_args)
+    if is_install:
+        pip_result = _install_via_staging(full_args, site_dir, _is_upgrade_request(full_args))
+    else:
+        full_args += ["--target", site_dir]
+        pip_result = _run_install_with_fallback(full_args)
     if pip_result == 0:
         try:
             _fix_missing_native_deps(site_dir)
