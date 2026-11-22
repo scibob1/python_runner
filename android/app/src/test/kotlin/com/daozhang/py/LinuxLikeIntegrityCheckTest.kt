@@ -151,6 +151,53 @@ class LinuxLikeIntegrityCheckTest {
     }
 
     @Test
+    fun ownedRootsCoverExtraImportDirectoriesOfAPackage() {
+        // none of these wheels has top_level.txt; their second import root must stay owned
+        assertEquals(
+            setOf("dateutil"),
+            LinuxLikeIntegrityCheck.ownedImportRoots(
+                "python_dateutil-2.9.0.dist-info",
+                emptyList(),
+                listOf("dateutil/__init__.py", "dateutil/parser/__init__.py", "python_dateutil-2.9.0.dist-info/RECORD")
+            )
+        )
+        assertEquals(
+            setOf("matplotlib", "mpl_toolkits", "pylab"),
+            LinuxLikeIntegrityCheck.ownedImportRoots(
+                "matplotlib-3.10.0.dist-info",
+                emptyList(),
+                listOf(
+                    "matplotlib/__init__.py",
+                    "matplotlib/_path.cpython-311-aarch64-linux-gnu.so",
+                    "mpl_toolkits/axes_grid1/__init__.py",
+                    "pylab.py",
+                    "matplotlib.libs/libfoo.so"
+                )
+            )
+        )
+        assertEquals(
+            setOf("optiland", "optiland_gui"),
+            LinuxLikeIntegrityCheck.ownedImportRoots(
+                "optiland-0.6.3.dist-info",
+                emptyList(),
+                listOf("optiland/__init__.py", "optiland_gui/__init__.py")
+            )
+        )
+    }
+
+    @Test
+    fun ownedRootsUnionDeclaredAndRecord() {
+        assertEquals(
+            setOf("yaml", "_yaml"),
+            LinuxLikeIntegrityCheck.ownedImportRoots(
+                "PyYAML-6.0.dist-info",
+                listOf("yaml"),
+                listOf("_yaml/__init__.py", "yaml/__init__.py")
+            )
+        )
+    }
+
+    @Test
     fun nonMetadataEntriesAreAlwaysOk() {
         val dir = site("loose/__init__.py")
         val result = LinuxLikeIntegrityCheck.resolve(dir, File(dir, "loose"), listOf("loose"), emptyList())

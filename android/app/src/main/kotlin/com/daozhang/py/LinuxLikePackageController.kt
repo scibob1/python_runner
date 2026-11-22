@@ -534,6 +534,9 @@ class LinuxLikePackageController(
         val integrity: LinuxLikeIntegrity
     )
 
+    private fun LinuxLikeDistribution.isMetadataBacked(): Boolean =
+        metadataDir.name.endsWith(".dist-info") || metadataDir.name.endsWith(".egg-info")
+
     private fun linuxLikeDistributions(): List<LinuxLikeDistribution> {
         val siteDir = linuxLikeRuntimeManager.userSitePackagesDir
         if (!siteDir.isDirectory) {
@@ -586,9 +589,15 @@ class LinuxLikePackageController(
             ?.distinctBy { it.normalizedName }
             ?: emptyList()
         val knownNames = metadataDistributions.map { it.normalizedName }.toSet()
+        // Most wheels have no top_level.txt, so also count the import roots listed in RECORD;
+        // otherwise a package's extra import directories look like separate, unowned packages.
         val metadataOwnedTopLevels = metadataDistributions
             .flatMap { distribution ->
-                distribution.topLevelEntries.map(::normalizePythonPackageName)
+                LinuxLikeIntegrityCheck.ownedImportRoots(
+                    distribution.metadataDir.name,
+                    distribution.topLevelEntries,
+                    distribution.recordEntries
+                ).map(::normalizePythonPackageName)
             }
             .toSet()
         val importPackageDistributions = siteDir.listFiles()
@@ -828,7 +837,10 @@ class LinuxLikePackageController(
             .toSet()
         return installed.keys
             .filter { name ->
-                !linuxLikeBootstrapPackages.contains(name) &&
+                // Only distributions with dist-info metadata have a dependency graph we can
+                // trust; loose directories/files are never treated as removable orphans.
+                installed[name]?.isMetadataBacked() == true &&
+                    !linuxLikeBootstrapPackages.contains(name) &&
                     !explicit.contains(name) &&
                     !required.contains(name)
             }

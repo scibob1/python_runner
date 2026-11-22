@@ -69,6 +69,22 @@ internal object LinuxLikeIntegrityCheck {
             .distinct()
     }
 
+    /**
+     * Every import root a metadata-backed distribution owns: the roots declared in
+     * top_level.txt plus the ones listed in RECORD. Used to tell a package's own extra
+     * import directories (`dateutil/` of python-dateutil, `optiland_gui/` of optiland,
+     * `pylab.py` of matplotlib) from loose directories nobody owns.
+     */
+    fun ownedImportRoots(
+        metadataDirName: String,
+        topLevelEntries: List<String>,
+        recordEntries: List<String>
+    ): Set<String> {
+        val declared = topLevelEntries.mapNotNull(::normalizeImportRoot)
+        val listed = recordEntries.mapNotNull { importRootFromRecordPath(it, metadataDirName) }
+        return (declared + listed).toSet()
+    }
+
     fun normalizeImportRoot(value: String): String? {
         val normalizedPath = value
             .trim()
