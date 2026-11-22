@@ -534,12 +534,6 @@ class LinuxLikePackageController(
         val integrity: LinuxLikeIntegrity
     )
 
-    private data class LinuxLikeIntegrity(
-        val status: String,
-        val message: String,
-        val missingImports: List<String>
-    )
-
     private fun linuxLikeDistributions(): List<LinuxLikeDistribution> {
         val siteDir = linuxLikeRuntimeManager.userSitePackagesDir
         if (!siteDir.isDirectory) {
@@ -581,7 +575,7 @@ class LinuxLikePackageController(
                     topLevelEntries = topLevelEntries,
                     recordEntries = recordEntries,
                     requires = requires,
-                    integrity = resolveLinuxLikeIntegrity(
+                    integrity = LinuxLikeIntegrityCheck.resolve(
                         siteDir,
                         metadataDir,
                         topLevelEntries,
@@ -726,106 +720,6 @@ class LinuxLikePackageController(
             index++
         }
         return builder.toString().takeIf { it.isNotBlank() }
-    }
-
-    private fun resolveLinuxLikeIntegrity(
-        siteDir: File,
-        metadataDir: File,
-        topLevelEntries: List<String>,
-        recordEntries: List<String>
-    ): LinuxLikeIntegrity {
-        val metadataBacked = metadataDir.name.endsWith(".dist-info") ||
-            metadataDir.name.endsWith(".egg-info")
-        if (!metadataBacked) {
-            return LinuxLikeIntegrity("ok", "", emptyList())
-        }
-        val importRoots = inferLinuxLikeImportRoots(
-            metadataDir.name,
-            topLevelEntries,
-            recordEntries
-        )
-        if (importRoots.isEmpty()) {
-            return LinuxLikeIntegrity("unknown", "", emptyList())
-        }
-        val missingImports = importRoots
-            .filterNot { linuxLikeImportRootExists(siteDir, it) }
-            .distinct()
-            .sorted()
-        if (missingImports.isEmpty()) {
-            return LinuxLikeIntegrity("ok", "", emptyList())
-        }
-        return LinuxLikeIntegrity(
-            "broken",
-            "缺少 ${missingImports.joinToString("、")}",
-            missingImports
-        )
-    }
-
-    private fun inferLinuxLikeImportRoots(
-        metadataDirName: String,
-        topLevelEntries: List<String>,
-        recordEntries: List<String>
-    ): List<String> {
-        val declaredRoots = topLevelEntries
-            .mapNotNull(::normalizePythonImportRoot)
-            .distinct()
-        if (declaredRoots.isNotEmpty()) {
-            return declaredRoots
-        }
-        return recordEntries
-            .mapNotNull { recordPath -> importRootFromRecordPath(recordPath, metadataDirName) }
-            .distinct()
-    }
-
-    private fun normalizePythonImportRoot(value: String): String? {
-        val normalizedPath = value
-            .trim()
-            .replace('\\', '/')
-            .trim('/')
-        if (normalizedPath.isBlank() || normalizedPath.contains("..")) {
-            return null
-        }
-        val root = normalizedPath
-            .substringBefore('/')
-            .substringBefore('.')
-            .trim()
-        return root.takeIf { it.matches(Regex("[A-Za-z_][A-Za-z0-9_]*")) }
-    }
-
-    private fun importRootFromRecordPath(recordPath: String, metadataDirName: String): String? {
-        val normalizedPath = recordPath
-            .trim()
-            .replace('\\', '/')
-            .trim('/')
-        if (normalizedPath.isBlank() || normalizedPath.contains("..")) {
-            return null
-        }
-        val firstSegment = normalizedPath.substringBefore('/').trim()
-        if (firstSegment.isBlank() ||
-            firstSegment == metadataDirName ||
-            firstSegment.endsWith(".dist-info") ||
-            firstSegment.endsWith(".egg-info") ||
-            firstSegment.endsWith(".data")
-        ) {
-            return null
-        }
-        if (!normalizedPath.contains('/')) {
-            if (!firstSegment.endsWith(".py")) {
-                return null
-            }
-            return normalizePythonImportRoot(firstSegment.dropLast(3))
-        }
-        return normalizePythonImportRoot(firstSegment)
-    }
-
-    private fun linuxLikeImportRootExists(siteDir: File, importRoot: String): Boolean {
-        val root = normalizePythonImportRoot(importRoot) ?: return false
-        if (File(siteDir, root).exists() || File(siteDir, "$root.py").isFile) {
-            return true
-        }
-        return siteDir.listFiles()?.any { file ->
-            file.isFile && file.name.startsWith("$root.")
-        } == true
     }
 
     private fun removeLinuxLikeDistributionFiles(distribution: LinuxLikeDistribution) {
