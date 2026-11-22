@@ -66,6 +66,7 @@ class MainActivity : FlutterActivity() {
             mainHandler.post { installSink?.success(event) }
         }
     }
+    private val linuxLikeShellLauncher by lazy { LinuxLikeShellLauncher(linuxLikeRuntimeManager) }
     private val linuxLikePackageController by lazy {
         LinuxLikePackageController(
             filesDir,
@@ -110,7 +111,7 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
-        // Register native crash handler ASAP 鈥?before Flutter engine init
+        // Register native crash handler ASAP 鈈?before Flutter engine init
         val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             try {
@@ -566,6 +567,13 @@ class MainActivity : FlutterActivity() {
             "getLinuxLikePythonInfo" to { _, result -> runtimeInfoController.getLinuxLikePythonInfo(result) },
             "getLinuxLikeRuntimeInfo" to { _, result ->
                 runtimeInfoController.getLinuxLikeRuntimeInfo(result)
+            },
+            "prepareLinuxLikeShell" to { call, result ->
+                linuxLikeShellLauncher.prepareAsync(call.argument<String>("workingDir"), mainHandler, result)
+            },
+            "releaseLinuxLikeShell" to { call, result ->
+                linuxLikeShellLauncher.release(call.argument<String>("tempDir"))
+                result.success(true)
             },
             "prepareLinuxLikeRuntime" to { _, result ->
                 runtimeInfoController.prepareLinuxLikeRuntime(result)
@@ -1092,5 +1100,4 @@ class MainActivity : FlutterActivity() {
         super.onDestroy()
     }
 }
-
 
