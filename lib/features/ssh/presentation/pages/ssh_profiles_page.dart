@@ -8,6 +8,7 @@ import '../../application/ssh_profile_store.dart';
 import '../../application/terminal/session_manager.dart';
 import '../../application/terminal/ssh_session.dart';
 import '../../domain/ssh_profile.dart';
+import '../debian_runtime_settings.dart';
 import '../python_launcher.dart';
 import '../python_run_dialogs.dart';
 import '../ssh_dialogs.dart';
@@ -16,7 +17,8 @@ import 'ssh_profile_edit_page.dart';
 import 'terminal_hub_page.dart';
 import 'terminal_logs_page.dart';
 
-/// Terminals on this phone (local shell, Python console) and saved SSH hosts.
+/// Terminals on this phone (local shell, Debian shell, Python console) and saved
+/// SSH hosts.
 /// Tap a host to open a terminal on it.
 class SshProfilesPage extends ConsumerStatefulWidget {
   const SshProfilesPage({super.key});
@@ -63,6 +65,15 @@ class _SshProfilesPageState extends ConsumerState<SshProfilesPage> {
   Future<void> _openLocal() async {
     try {
       final session = _manager.createLocal();
+      await openTerminalHub(context, sessionId: session.id);
+    } on StateError catch (e) {
+      _toast(e.message);
+    }
+  }
+
+  Future<void> _openDebian() async {
+    try {
+      final session = _manager.createDebian();
       await openTerminalHub(context, sessionId: session.id);
     } on StateError catch (e) {
       _toast(e.message);
@@ -208,6 +219,33 @@ class _SshProfilesPageState extends ConsumerState<SshProfilesPage> {
               MaterialPageRoute<void>(builder: (_) => const TerminalLogsPage()),
             ),
           ),
+          PopupMenuButton<String>(
+            tooltip: t('更多', 'More'),
+            onSelected: (value) {
+              switch (value) {
+                case 'localDir':
+                  showLocalShellSettingsDialog(context);
+                case 'debianSettings':
+                  showDebianRuntimeSettingsDialog(context);
+                case 'debianDiagnostics':
+                  openDebianDiagnostics(context);
+              }
+            },
+            itemBuilder: (context) => [
+              PopupMenuItem(
+                value: 'localDir',
+                child: Text(t('本机 Shell 启动目录…', 'Local shell start directory…')),
+              ),
+              PopupMenuItem(
+                value: 'debianSettings',
+                child: Text(t('Debian 运行时设置…', 'Debian runtime settings…')),
+              ),
+              PopupMenuItem(
+                value: 'debianDiagnostics',
+                child: Text(t('运行时诊断', 'Runtime diagnostics')),
+              ),
+            ],
+          ),
         ],
       ),
       floatingActionButton: FloatingActionButton.extended(
@@ -280,6 +318,37 @@ class _SshProfilesPageState extends ConsumerState<SshProfilesPage> {
                   ),
                   isThreeLine: true,
                   onTap: () => showRunPythonFileDialog(context, ref),
+                ),
+                _sectionTitle(context, t('Debian（proot）', 'Debian (proot)')),
+                ListTile(
+                  leading: const Icon(Icons.developer_board),
+                  title: Text(t('Debian 终端', 'Debian terminal')),
+                  subtitle: Text(
+                    t(
+                      '在 proot 里的 Debian 中打开 bash：可以用 python3、pip，/python-runner 是脚本用的包目录。没有 PTY（伪终端），不支持 vim 等全屏程序',
+                      'bash in the Debian inside proot: python3 and pip work, and /python-runner is the package directory scripts use. No PTY (pseudo terminal), so no vim and other full-screen programs',
+                    ),
+                    style: const TextStyle(fontSize: 12),
+                  ),
+                  isThreeLine: true,
+                  trailing: IconButton(
+                    icon: const Icon(Icons.tune),
+                    tooltip: t('Debian 运行时设置', 'Debian runtime settings'),
+                    onPressed: () => showDebianRuntimeSettingsDialog(context),
+                  ),
+                  onTap: _openDebian,
+                ),
+                ListTile(
+                  leading: const Icon(Icons.fact_check_outlined),
+                  title: Text(t('运行时诊断', 'Runtime diagnostics')),
+                  subtitle: Text(
+                    t(
+                      '查看 Debian 运行时的路径、兼容模式和自检结果，可以复制',
+                      'Paths, compatibility mode and self-check results of the Debian runtime; can be copied',
+                    ),
+                    style: const TextStyle(fontSize: 12),
+                  ),
+                  onTap: () => openDebianDiagnostics(context),
                 ),
                 _sectionTitle(context, t('SSH 主机', 'SSH hosts')),
                 Padding(
