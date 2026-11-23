@@ -330,15 +330,14 @@ void main() {
     await tester.pump(const Duration(milliseconds: 600));
   });
 
-  testWidgets('missing timeout preference uses the visible 60-second default',
-      (tester) async {
+  testWidgets('missing timeout preference means no timeout', (tester) async {
     SharedPreferences.setMockInitialValues(const {});
     final bridge = _ExecutionBridgeFake();
     final provider = ExecutionProvider(bridge);
 
     await provider.executeScript('demo.py');
 
-    expect(bridge.lastTimeoutSeconds, 60);
+    expect(bridge.lastTimeoutSeconds, isNull);
 
     provider.dispose();
     await tester.pump(const Duration(milliseconds: 600));
@@ -354,6 +353,22 @@ void main() {
     await provider.executeScript('demo.py');
 
     expect(bridge.lastTimeoutSeconds, isNull);
+
+    provider.dispose();
+    await tester.pump(const Duration(milliseconds: 600));
+  });
+
+  testWidgets('a timeout the person set in Settings still applies',
+      (tester) async {
+    SharedPreferences.setMockInitialValues(const {
+      'execution_timeout': 300,
+    });
+    final bridge = _ExecutionBridgeFake();
+    final provider = ExecutionProvider(bridge);
+
+    await provider.executeScript('demo.py');
+
+    expect(bridge.lastTimeoutSeconds, 300);
 
     provider.dispose();
     await tester.pump(const Duration(milliseconds: 600));

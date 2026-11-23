@@ -14,7 +14,7 @@ extension _SettingsActions on _SettingsPageState {
     if (!mounted) return;
     setState(() {
       _mirrorController.text = prefs.getString('pypi_index_url') ?? '';
-      _timeout = prefs.getInt('execution_timeout') ?? 60;
+      _timeout = prefs.getInt('execution_timeout') ?? 0;
       _exportDir = prefs.getString('export_dir');
       _workingDir = prefs.getString('working_dir');
       _netDebugMode = prefs.getBool('net_debug_mode') ?? false;

@@ -53,7 +53,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   final _proxyHostController = TextEditingController();
   final _proxyPortController = TextEditingController();
   final _githubMirrorController = TextEditingController();
-  int _timeout = 60;
+  int _timeout = 0;
   bool _netDebugMode = false;
   bool _netAllowInsecure = false;
   bool _overrideEnabled = false;
