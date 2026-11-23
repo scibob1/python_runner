@@ -3,14 +3,20 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:python_runner/features/scripts/application/script_workspace_controller.dart';
+import 'package:python_runner/services/native_bridge.dart';
 
+import '../../application/local_shell_prefs.dart';
 import '../../application/python_launch.dart';
 import '../../application/ssh_connection.dart' show HostKeyPrompt;
 import '../../application/ssh_profile_store.dart';
+import '../../application/terminal/debian_shell_session.dart';
+import '../../application/terminal/local_shell_session.dart';
 import '../../application/terminal/session_manager.dart';
 import '../../application/terminal/terminal_session.dart';
 import '../../domain/ssh_profile.dart';
+import '../debian_runtime_settings.dart';
 import '../python_launcher.dart' as launcher;
+import '../python_run_dialogs.dart';
 import '../ssh_text.dart';
 import '../widgets/terminal_pane.dart';
 import 'ssh_profiles_page.dart';
@@ -210,6 +216,15 @@ class _TerminalHubPageState extends ConsumerState<TerminalHubPage>
     }
   }
 
+  void _newDebian() {
+    try {
+      final session = _manager.createDebian();
+      setState(() => _activeId = session.id);
+    } on StateError catch (e) {
+      _toast(e.message);
+    }
+  }
+
   void _newSsh(SshProfile profile) {
     try {
       final session = _manager.createSsh(profile);
@@ -233,9 +248,29 @@ class _TerminalHubPageState extends ConsumerState<TerminalHubPage>
             ListTile(
               leading: const Icon(Icons.terminal),
               title: Text(t('本机 Shell', 'Local shell')),
+              subtitle: Text(
+                t(
+                  'Android 自带 sh，看不到 Debian 里的文件',
+                  "Android's own sh, cannot see Debian files",
+                ),
+              ),
               onTap: () {
                 Navigator.pop(ctx);
                 _newLocal();
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.developer_board),
+              title: Text(t('Debian 终端', 'Debian terminal')),
+              subtitle: Text(
+                t(
+                  'proot 里的 Debian：python3、pip、/python-runner',
+                  'Debian in proot: python3, pip, /python-runner',
+                ),
+              ),
+              onTap: () {
+                Navigator.pop(ctx);
+                _newDebian();
               },
             ),
             for (final profile in profiles)
@@ -271,6 +306,145 @@ class _TerminalHubPageState extends ConsumerState<TerminalHubPage>
     await _manager.remove(session.id);
     if (mounted && _activeId == session.id) {
       setState(() => _activeId = null);
+    }
+  }
+
+  String _shellQuote(String value) {
+    final escaped = value.replaceAll("'", r"'\''");
+    return "'$escaped'";
+  }
+
+  /// "Script working directory": `cd` into the directory scripts run in.
+  Future<void> _enterScriptDir(TerminalSession? session) async {
+    final t = SshText.of(context);
+    final dir = await LocalShellPrefs.loadScriptWorkingDir();
+    if (!mounted) return;
+    if (dir == null) {
+      _toast(
+        t(
+          '还没有设置脚本工作目录（在设置里可以设置）',
+          'No script working directory is set (see Settings)',
+        ),
+      );
+      return;
+    }
+    session?.sendText('cd ${_shellQuote(dir)}\n');
+  }
+
+  Future<void> _exportSessionLog(TerminalSession session) async {
+    final t = SshText.of(context);
+    final text = session.ring.read(0, maxChars: 1000000).text;
+    if (text.trim().isEmpty) {
+      _toast(t('没有可导出的内容', 'Nothing to export'));
+      return;
+    }
+    final name = session.title.replaceAll(RegExp(r'[^A-Za-z0-9_.-]+'), '_');
+    final stamp = DateTime.now()
+        .toIso8601String()
+        .replaceAll(RegExp(r'[^0-9]'), '')
+        .substring(0, 14);
+    try {
+      final path = await NativeBridge().exportLog(
+        text,
+        fileName: 'terminal-$name-$stamp.txt',
+      );
+      if (!mounted) return;
+      _toast(
+        path.isEmpty
+            ? t('已导出', 'Exported')
+            : t('已导出到 $path', 'Exported to $path'),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      _toast(t('导出失败：$e', 'Export failed: $e'));
+    }
+  }
+
+  PopupMenuItem<String> _item(SshText t, String value, String zh, String en) {
+    return PopupMenuItem<String>(value: value, child: Text(t(zh, en)));
+  }
+
+  /// The ⋮ menu: what is offered depends on the kind of the current session.
+  List<PopupMenuEntry<String>> _menuEntries(
+    SshText t,
+    TerminalSession? session,
+  ) {
+    final entries = <PopupMenuEntry<String>>[];
+    if (session is LocalShellSession) {
+      entries
+        ..add(_item(t, 'startDir', '启动目录…', 'Start directory…'))
+        ..add(_item(t, 'scriptDir', '脚本工作目录', 'Script working directory'))
+        ..add(_item(t, 'help', '内置命令说明', 'Built-in commands'))
+        ..add(_item(t, 'interrupt', '中断 (SIGINT)', 'Interrupt (SIGINT)'))
+        ..add(_item(t, 'forceStop', '强制结束', 'Force stop'))
+        ..add(_item(t, 'closeTab', '关闭此终端', 'Close this terminal'));
+    } else if (session is DebianShellSession) {
+      entries
+        ..add(_item(t, 'interrupt', '中断 (SIGINT)', 'Interrupt (SIGINT)'))
+        ..add(_item(t, 'forceStop', '强制结束', 'Force stop'))
+        ..add(_item(t, 'closeTab', '关闭此终端', 'Close this terminal'));
+    } else if (session != null) {
+      entries
+        ..add(_item(t, 'disconnect', '断开连接', 'Disconnect'))
+        ..add(_item(t, 'reconnect', '重新连接', 'Reconnect'))
+        ..add(_item(t, 'interrupt', '中断', 'Interrupt'));
+    }
+    if (session != null) {
+      entries
+        ..add(const PopupMenuDivider())
+        ..add(_item(t, 'clear', '清屏', 'Clear screen'))
+        ..add(_item(t, 'export', '导出本会话日志', 'Export this session log'));
+    }
+    entries
+      ..add(const PopupMenuDivider())
+      ..add(
+        _item(
+          t,
+          'debianSettings',
+          'Debian 运行时设置…',
+          'Debian runtime settings…',
+        ),
+      )
+      ..add(_item(t, 'debianDiagnostics', '运行时诊断', 'Runtime diagnostics'));
+    return entries;
+  }
+
+  Future<void> _onMenu(String value, TerminalSession? session) async {
+    switch (value) {
+      case 'startDir':
+        final t = SshText.of(context);
+        final changed = await showLocalShellSettingsDialog(context);
+        if (!mounted) return;
+        if (changed && session != null) {
+          _toast(
+            t(
+              '启动目录已保存，正在重启此终端',
+              'Start directory saved, restarting this terminal',
+            ),
+          );
+          unawaited(session.restart());
+        }
+      case 'scriptDir':
+        await _enterScriptDir(session);
+      case 'help':
+        if (session is LocalShellSession) session.printHelp();
+      case 'interrupt':
+        session?.interrupt();
+      case 'forceStop':
+      case 'disconnect':
+        await session?.close();
+      case 'reconnect':
+        if (session != null) unawaited(session.restart());
+      case 'closeTab':
+        if (session != null) await _closeSession(session);
+      case 'clear':
+        session?.terminal.write('\x1b[3J\x1b[2J\x1b[H');
+      case 'export':
+        if (session != null) await _exportSessionLog(session);
+      case 'debianSettings':
+        await showDebianRuntimeSettingsDialog(context);
+      case 'debianDiagnostics':
+        await openDebianDiagnostics(context);
     }
   }
 
@@ -372,6 +546,11 @@ class _TerminalHubPageState extends ConsumerState<TerminalHubPage>
               tooltip: t('重新连接 / 重启', 'Reconnect / restart'),
               onPressed: () => unawaited(active.restart()),
             ),
+          PopupMenuButton<String>(
+            tooltip: t('更多', 'More'),
+            onSelected: (value) => unawaited(_onMenu(value, active)),
+            itemBuilder: (_) => _menuEntries(t, active),
+          ),
         ],
       ),
       body: active == null
