@@ -20,13 +20,16 @@ class PythonForegroundService : Service() {
         const val EXTRA_SCRIPT_NAME = "script_name"
         const val TASK_EXECUTE = "execute"
         const val TASK_PIP_INSTALL = "pip_install"
+        const val TASK_TERMINAL = "terminal"
     }
 
     private var scriptName: String? = null
+    private var currentTask: String = TASK_EXECUTE
     private var startTime: Long = 0
     private val updateHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private val updateRunnable = object : Runnable {
         override fun run() {
+            renewWakeLock()
             updateNotificationWithDuration()
             updateHandler.postDelayed(this, 10_000)
         }
@@ -44,6 +47,14 @@ class PythonForegroundService : Service() {
         } catch (e: Exception) {
             android.util.Log.w("PythonRunner", "WakeLock acquire failed: ${e.message}")
         }
+    }
+
+    /** The lock is leased for 4 hours; long computations and terminals outlive that. */
+    private fun renewWakeLock() {
+        try {
+            val lock = wakeLock ?: return
+            if (!lock.isHeld) lock.acquire(4 * 60 * 60 * 1000L)
+        } catch (_: Exception) {}
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
@@ -85,6 +96,7 @@ class PythonForegroundService : Service() {
         }
 
         val taskType = intent?.getStringExtra(EXTRA_TASK_TYPE) ?: TASK_EXECUTE
+        currentTask = taskType
         scriptName = intent?.getStringExtra(EXTRA_SCRIPT_NAME)
         startTime = System.currentTimeMillis()
 
@@ -92,6 +104,7 @@ class PythonForegroundService : Service() {
         try {
             val contentText = when (taskType) {
                 TASK_PIP_INSTALL -> "正在安装 Python 包..."
+                TASK_TERMINAL -> "终端运行中..."
                 else -> {
                     val name = scriptName?.removeSuffix(".py") ?: "脚本"
                     "$name 运行中..."
@@ -125,7 +138,7 @@ class PythonForegroundService : Service() {
     }
 
     private fun updateNotificationWithDuration() {
-        val name = scriptName?.removeSuffix(".py") ?: "脚本"
+        val name = if (currentTask == TASK_TERMINAL) "终端" else scriptName?.removeSuffix(".py") ?: "脚本"
         val elapsed = (System.currentTimeMillis() - startTime) / 1000
         val duration = when {
             elapsed < 60 -> "${elapsed}s"

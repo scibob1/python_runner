@@ -98,6 +98,10 @@ class MainActivity : FlutterActivity() {
         )
     }
     private var batteryOptRequested = false
+    // Who wants PythonForegroundService (it holds the partial wake lock): a running
+    // script, an open terminal, or both. It stops only when nobody does.
+    private var scriptServiceWanted = false
+    private var terminalServiceWanted = false
     private var mcpKeepAliveWanted = false
     private var mcpOverlayPermissionPending = false
     private var mcpOverlayColors = mapOf<String, Int>()
@@ -111,7 +115,7 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
-        // Register native crash handler ASAP 鈈?before Flutter engine init
+        // Register native crash handler ASAP 鈥?before Flutter engine init
         val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             try {
@@ -642,6 +646,18 @@ class MainActivity : FlutterActivity() {
             "listLinuxLikePackages" to { _, result ->
                 linuxLikePackageController.listLinuxLikePackages(result)
             },
+            "setKeepScreenOn" to { call, result ->
+                if (call.argument<Boolean>("enabled") == true) {
+                    window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                } else {
+                    window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                }
+                result.success(true)
+            },
+            "setTerminalKeepAlive" to { call, result ->
+                setTerminalServiceWanted(call.argument<Boolean>("enabled") == true)
+                result.success(true)
+            },
             "moveToBackground" to { _, result ->
                 moveTaskToBack(true)
                 result.success(null)
@@ -1026,9 +1042,30 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun stopServiceSafely() {
+        scriptServiceWanted = false
+        if (terminalServiceWanted) {
+            // An open terminal still needs the service: show its notice again.
+            launchForegroundService(PythonForegroundService.TASK_TERMINAL, null)
+        } else {
+            haltForegroundService()
+        }
+    }
+
+    private fun haltForegroundService() {
         try {
             stopService(Intent(this, PythonForegroundService::class.java))
         } catch (_: Exception) {}
+    }
+
+    private fun setTerminalServiceWanted(wanted: Boolean) {
+        if (terminalServiceWanted == wanted) return
+        terminalServiceWanted = wanted
+        if (scriptServiceWanted) return
+        if (wanted) {
+            launchForegroundService(PythonForegroundService.TASK_TERMINAL, null)
+        } else {
+            haltForegroundService()
+        }
     }
 
     private fun _writeScriptErrorLog(scriptName: String, errorMessage: String, stackTrace: String?) {
@@ -1050,6 +1087,11 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun startForegroundServiceSafely(taskType: String, scriptName: String? = null) {
+        scriptServiceWanted = true
+        launchForegroundService(taskType, scriptName)
+    }
+
+    private fun launchForegroundService(taskType: String, scriptName: String?) {
         try {
             val intent = Intent(this, PythonForegroundService::class.java).apply {
                 putExtra(PythonForegroundService.EXTRA_TASK_TYPE, taskType)
@@ -1093,6 +1135,10 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
+        if (terminalServiceWanted) {
+            terminalServiceWanted = false
+            if (!scriptServiceWanted) haltForegroundService()
+        }
         mcpKeepAliveWanted = false
         stopService(Intent(this, McpKeepAliveService::class.java))
         scriptExecutionController.shutdown()
@@ -1100,4 +1146,5 @@ class MainActivity : FlutterActivity() {
         super.onDestroy()
     }
 }
+
 
