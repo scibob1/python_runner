@@ -285,6 +285,19 @@ class McpTerminalService extends ChangeNotifier {
     return const <String, dynamic>{};
   }
 
+  /// What the AI is working with in a session of this kind: the three shells
+  /// differ in where files and programs live.
+  static String environmentOf(TerminalSession session) {
+    return switch (session.kind) {
+      'debian' =>
+        'bash in the Debian guest (proot): python3, pip, apt; the package directory scripts use is /python-runner/site-packages. No PTY, so no full-screen programs such as vim or top',
+      'local' =>
+        'Android sh on the phone itself: it cannot see files inside the Debian guest. python, python3, run, scripts and pyhelp are built-in commands. No PTY, so no full-screen programs',
+      'ssh' => 'A remote shell over SSH, opened by the user',
+      _ => session.kind,
+    };
+  }
+
   Map<String, dynamic> listSessions() {
     _guard();
     return <String, dynamic>{
@@ -292,6 +305,7 @@ class McpTerminalService extends ChangeNotifier {
         for (final s in _sessions.sessions)
           <String, Object?>{
             ...s.describe(),
+            'environment': environmentOf(s),
             'opened_by_ai': _aiOpened.contains(s.id),
             ..._inputHints(s),
           },
@@ -299,12 +313,26 @@ class McpTerminalService extends ChangeNotifier {
     };
   }
 
-  /// Opens a local shell. It shows up as a tab for the person, too.
-  Future<Map<String, dynamic>> openLocal({String? title}) async {
+  /// Opens a local shell (Android sh) or a Debian shell (bash in the proot
+  /// guest). It shows up as a tab for the person, too. SSH is for the person.
+  Future<Map<String, dynamic>> openSession({
+    String kind = 'local',
+    String? title,
+  }) async {
     _guard();
+    if (kind != 'local' && kind != 'debian') {
+      throw McpToolException(
+        McpErrorCodes.invalidArgument,
+        'kind must be "local" or "debian". SSH sessions must be opened by the user',
+        false,
+        {'kind': kind},
+      );
+    }
     final TerminalSession session;
     try {
-      session = _sessions.createLocal();
+      session = kind == 'debian'
+          ? _sessions.createDebian()
+          : _sessions.createLocal();
     } on StateError catch (error) {
       throw McpToolException('TOO_MANY_TERMINALS', error.message, false);
     }
@@ -314,7 +342,24 @@ class McpTerminalService extends ChangeNotifier {
     _op('open', 'Opened ${session.id} (${session.title})',
         sid: session.id, importance: 0);
     await session.start();
-    return <String, dynamic>{'opened': true, ...session.describe()};
+    if (session.status == TerminalSessionStatus.failed) {
+      final detail = session.statusDetail ?? '';
+      _aiOpened.remove(session.id);
+      await _sessions.remove(session.id);
+      throw McpToolException(
+        'TERMINAL_START_FAILED',
+        kind == 'debian'
+            ? 'The Debian terminal could not start: $detail. The Debian runtime may not be installed or ready; ask the user to check it in Python Runner (Terminal & SSH > Debian > Runtime diagnostics)'
+            : 'The local shell could not start: $detail',
+        false,
+        {'kind': kind},
+      );
+    }
+    return <String, dynamic>{
+      'opened': true,
+      ...session.describe(),
+      'environment': environmentOf(session),
+    };
   }
 
   /// Closes a session the AI opened itself; the person's sessions are theirs.
