@@ -13,6 +13,7 @@ import '../services/native_bridge.dart';
 import '../services/app_logger.dart';
 import '../services/app_update_manager.dart';
 import '../services/network_debug_config.dart';
+import '../services/runtime_keep_awake.dart';
 import '../services/request_override_config.dart';
 import '../runtime/runtime_manager.dart';
 import '../providers/execution_provider.dart';
@@ -33,6 +34,7 @@ import 'app_file_picker_page.dart';
 import 'request_override_editor_page.dart';
 
 part 'settings_actions.dart';
+part 'settings_keep_awake.dart';
 part 'settings_sections.dart';
 part 'settings_ssh.dart';
 part 'settings_widgets.dart';
@@ -89,6 +91,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                     _buildAppearanceSection(),
                     _buildScriptStorageSection(),
                     _buildRuntimeSection(),
+                    const _KeepAwakeCard(),
                     _buildSshSection(),
                     _buildNetworkDebugSection(),
                     _buildDiagnosticsSection(),
