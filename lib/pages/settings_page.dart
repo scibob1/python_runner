@@ -89,12 +89,12 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
             delegate: SliverChildListDelegate(
               [
                     _buildAppearanceSection(),
-                    _buildScriptStorageSection(),
-                    _buildRuntimeSection(),
-                    const _KeepAwakeCard(),
                     _buildSshSection(),
                     _buildNetworkDebugSection(),
+                    _buildScriptStorageSection(),
+                    _buildRuntimeSection(),
                     _buildDiagnosticsSection(),
+                    const _KeepAwakeCard(),
                     _buildAboutSection(),
                   ]
                   .map(

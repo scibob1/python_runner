@@ -49,11 +49,12 @@ void main() {
           .toList();
       expect(sections.map((section) => section.title), [
         '外观与语言',
-        '脚本与存储',
-        '运行引擎',
         '终端与 SSH',
         '网络与连接',
+        '脚本与存储',
+        '运行引擎',
         '诊断与日志',
+        '运行时保活',
         '关于与更新',
       ]);
       Finder section(String title) => find.byWidgetPredicate(
