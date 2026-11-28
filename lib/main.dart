@@ -20,6 +20,8 @@ import 'services/app_update_manager.dart';
 import 'services/http_inspector_store.dart';
 import 'services/network_debug_config.dart';
 import 'services/request_override_config.dart';
+import 'services/runtime_keep_awake.dart';
+import 'features/ssh/application/terminal/session_manager.dart';
 import 'providers/execution_provider.dart';
 import 'features/packages/application/package_controller.dart';
 import 'features/mcp/application/mcp_server_controller.dart';
@@ -92,6 +94,17 @@ void main() async {
 
   final bridge = NativeBridge();
   final execution = ExecutionProvider(bridge);
+
+  // Screen on while a script runs or a terminal is open, and terminals kept alive in the
+  // background (both can be switched off in Settings).
+  final terminals = TerminalSessionManager.instance;
+  unawaited(
+    RuntimeKeepAwake(
+      sources: Listenable.merge(<Listenable>[execution, terminals]),
+      scriptRunning: () => execution.isRunning,
+      terminalOpen: () => terminals.sessions.any((session) => session.isAlive),
+    ).start(),
+  );
 
   // runApp must run in the same zone as WidgetsFlutterBinding.ensureInitialized()
   // (the root zone); uncaught async errors are already reported through

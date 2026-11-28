@@ -19,6 +19,60 @@ class LinuxLikePackageController(
 ) {
     private val linuxLikeBootstrapPackages = setOf("pip", "setuptools", "wheel")
 
+    private val userSiteStagingDir: File
+        get() = File(filesDir, "linux_like/user_site_staging")
+
+    /**
+     * Runs `pip install` into a fresh staging directory and merges a successful result into
+     * user_site_packages (all or nothing, see [LinuxLikePipStaging]). The guest sees filesDir
+     * at the same path, so the staging path is handed to pip as --target unchanged. A failed
+     * pip run, or a failed merge, leaves user_site_packages exactly as it was.
+     *
+     * [pipArgs] are the pip arguments without --target (it is inserted after `install`).
+     */
+    private fun runStagedPipInstall(
+        pipArgs: List<String>,
+        upgrade: Boolean,
+        workingDir: String? = null
+    ): LinuxLikeCommandResult {
+        return LinuxLikePipStaging.withStagingDir(userSiteStagingDir) { staging ->
+            val args = pipArgs.toMutableList()
+            args.addAll(args.indexOf("install") + 1, listOf("--target", staging.absolutePath))
+            val command = linuxLikeRuntimeManager.buildPythonModuleCommand(
+                "pip",
+                args,
+                workingDir = workingDir
+            )
+            val result = runLinuxLikeCommandBlocking(command)
+            if (result.exitCode != 0) {
+                return@withStagingDir result
+            }
+            try {
+                val merged = LinuxLikePipStaging.merge(
+                    staging,
+                    linuxLikeRuntimeManager.userSitePackagesDir,
+                    upgrade
+                )
+                val kept = merged.skipped.filterNot { LinuxLikePipStaging.isMetaDir(it) }
+                if (kept.isNotEmpty()) {
+                    sendLog(
+                        "stdout",
+                        "提示: 以下已安装的项目未被替换（如需更新请使用修复）: ${kept.joinToString(", ")}",
+                        null
+                    )
+                }
+                result
+            } catch (e: Exception) {
+                LinuxLikeCommandResult(
+                    exitCode = 1,
+                    stdout = result.stdout,
+                    stderr = "安装文件合并失败，已回滚，已安装的包未被改动: " +
+                        "${e.javaClass.simpleName}: ${e.message}"
+                )
+            }
+        }
+    }
+
     private data class LinuxLikeRequirementsTarget(
         val file: File,
         val pipPath: String,
@@ -53,9 +107,7 @@ class LinuxLikePackageController(
                 }
                 val args = mutableListOf(
                     "--disable-pip-version-check",
-                    "install",
-                    "--target",
-                    linuxLikeRuntimeManager.userSitePackagesGuestPath
+                    "install"
                 )
                 if (!indexUrl.isNullOrBlank()) {
                     args.add("-i")
@@ -65,12 +117,11 @@ class LinuxLikePackageController(
                 args.add(target.pipPath)
 
                 sendInstallProgress("requirements.txt", "installing", "开始安装 $label...")
-                val command = linuxLikeRuntimeManager.buildPythonModuleCommand(
-                    "pip",
+                val commandResult = runStagedPipInstall(
                     args,
+                    upgrade = false,
                     workingDir = target.workingDir
                 )
-                val commandResult = runLinuxLikeCommandBlocking(command)
                 if (commandResult.exitCode == 0) {
                     val requestedPackages = readLinuxLikeRequirementPackageNames(target.file)
                     recordLinuxLikeExplicitPackages(requestedPackages)
@@ -158,9 +209,7 @@ class LinuxLikePackageController(
                 val packageSpec = if (!version.isNullOrBlank()) "$packageName==$version" else packageName
                 val args = mutableListOf(
                     "--disable-pip-version-check",
-                    "install",
-                    "--target",
-                    linuxLikeRuntimeManager.userSitePackagesGuestPath
+                    "install"
                 )
                 if (!indexUrl.isNullOrBlank()) {
                     args.add("-i")
@@ -168,8 +217,7 @@ class LinuxLikePackageController(
                 }
                 args.add(packageSpec)
                 sendInstallProgress(packageName, "installing", "开始安装 $packageSpec...")
-                val command = linuxLikeRuntimeManager.buildPythonModuleCommand("pip", args)
-                val commandResult = runLinuxLikeCommandBlocking(command)
+                val commandResult = runStagedPipInstall(args, upgrade = false)
                 if (commandResult.exitCode == 0) {
                     sendInstallProgress(packageName, "正在校验 $packageName 是否已安装...", "正在校验 $packageName 是否已安装...")
                     val verifyResult = verifyLinuxLikePackageInstalled(packageName)
@@ -221,8 +269,6 @@ class LinuxLikePackageController(
                 val args = mutableListOf(
                     "--disable-pip-version-check",
                     "install",
-                    "--target",
-                    linuxLikeRuntimeManager.userSitePackagesGuestPath,
                     "--upgrade",
                     "--force-reinstall"
                 )
@@ -232,8 +278,7 @@ class LinuxLikePackageController(
                 }
                 args.add(packageSpec)
                 sendInstallProgress(packageName, "repairing", "开始修复 $packageSpec...")
-                val command = linuxLikeRuntimeManager.buildPythonModuleCommand("pip", args)
-                val commandResult = runLinuxLikeCommandBlocking(command)
+                val commandResult = runStagedPipInstall(args, upgrade = true)
                 if (commandResult.exitCode == 0) {
                     sendInstallProgress(packageName, "repairing", "正在校验 $packageName 是否已恢复...")
                     val verifyResult = verifyLinuxLikePackageInstalled(packageName)
@@ -534,11 +579,8 @@ class LinuxLikePackageController(
         val integrity: LinuxLikeIntegrity
     )
 
-    private data class LinuxLikeIntegrity(
-        val status: String,
-        val message: String,
-        val missingImports: List<String>
-    )
+    private fun LinuxLikeDistribution.isMetadataBacked(): Boolean =
+        metadataDir.name.endsWith(".dist-info") || metadataDir.name.endsWith(".egg-info")
 
     private fun linuxLikeDistributions(): List<LinuxLikeDistribution> {
         val siteDir = linuxLikeRuntimeManager.userSitePackagesDir
@@ -581,7 +623,7 @@ class LinuxLikePackageController(
                     topLevelEntries = topLevelEntries,
                     recordEntries = recordEntries,
                     requires = requires,
-                    integrity = resolveLinuxLikeIntegrity(
+                    integrity = LinuxLikeIntegrityCheck.resolve(
                         siteDir,
                         metadataDir,
                         topLevelEntries,
@@ -592,9 +634,15 @@ class LinuxLikePackageController(
             ?.distinctBy { it.normalizedName }
             ?: emptyList()
         val knownNames = metadataDistributions.map { it.normalizedName }.toSet()
+        // Most wheels have no top_level.txt, so also count the import roots listed in RECORD;
+        // otherwise a package's extra import directories look like separate, unowned packages.
         val metadataOwnedTopLevels = metadataDistributions
             .flatMap { distribution ->
-                distribution.topLevelEntries.map(::normalizePythonPackageName)
+                LinuxLikeIntegrityCheck.ownedImportRoots(
+                    distribution.metadataDir.name,
+                    distribution.topLevelEntries,
+                    distribution.recordEntries
+                ).map(::normalizePythonPackageName)
             }
             .toSet()
         val importPackageDistributions = siteDir.listFiles()
@@ -728,106 +776,6 @@ class LinuxLikePackageController(
         return builder.toString().takeIf { it.isNotBlank() }
     }
 
-    private fun resolveLinuxLikeIntegrity(
-        siteDir: File,
-        metadataDir: File,
-        topLevelEntries: List<String>,
-        recordEntries: List<String>
-    ): LinuxLikeIntegrity {
-        val metadataBacked = metadataDir.name.endsWith(".dist-info") ||
-            metadataDir.name.endsWith(".egg-info")
-        if (!metadataBacked) {
-            return LinuxLikeIntegrity("ok", "", emptyList())
-        }
-        val importRoots = inferLinuxLikeImportRoots(
-            metadataDir.name,
-            topLevelEntries,
-            recordEntries
-        )
-        if (importRoots.isEmpty()) {
-            return LinuxLikeIntegrity("unknown", "", emptyList())
-        }
-        val missingImports = importRoots
-            .filterNot { linuxLikeImportRootExists(siteDir, it) }
-            .distinct()
-            .sorted()
-        if (missingImports.isEmpty()) {
-            return LinuxLikeIntegrity("ok", "", emptyList())
-        }
-        return LinuxLikeIntegrity(
-            "broken",
-            "缺少 ${missingImports.joinToString("、")}",
-            missingImports
-        )
-    }
-
-    private fun inferLinuxLikeImportRoots(
-        metadataDirName: String,
-        topLevelEntries: List<String>,
-        recordEntries: List<String>
-    ): List<String> {
-        val declaredRoots = topLevelEntries
-            .mapNotNull(::normalizePythonImportRoot)
-            .distinct()
-        if (declaredRoots.isNotEmpty()) {
-            return declaredRoots
-        }
-        return recordEntries
-            .mapNotNull { recordPath -> importRootFromRecordPath(recordPath, metadataDirName) }
-            .distinct()
-    }
-
-    private fun normalizePythonImportRoot(value: String): String? {
-        val normalizedPath = value
-            .trim()
-            .replace('\\', '/')
-            .trim('/')
-        if (normalizedPath.isBlank() || normalizedPath.contains("..")) {
-            return null
-        }
-        val root = normalizedPath
-            .substringBefore('/')
-            .substringBefore('.')
-            .trim()
-        return root.takeIf { it.matches(Regex("[A-Za-z_][A-Za-z0-9_]*")) }
-    }
-
-    private fun importRootFromRecordPath(recordPath: String, metadataDirName: String): String? {
-        val normalizedPath = recordPath
-            .trim()
-            .replace('\\', '/')
-            .trim('/')
-        if (normalizedPath.isBlank() || normalizedPath.contains("..")) {
-            return null
-        }
-        val firstSegment = normalizedPath.substringBefore('/').trim()
-        if (firstSegment.isBlank() ||
-            firstSegment == metadataDirName ||
-            firstSegment.endsWith(".dist-info") ||
-            firstSegment.endsWith(".egg-info") ||
-            firstSegment.endsWith(".data")
-        ) {
-            return null
-        }
-        if (!normalizedPath.contains('/')) {
-            if (!firstSegment.endsWith(".py")) {
-                return null
-            }
-            return normalizePythonImportRoot(firstSegment.dropLast(3))
-        }
-        return normalizePythonImportRoot(firstSegment)
-    }
-
-    private fun linuxLikeImportRootExists(siteDir: File, importRoot: String): Boolean {
-        val root = normalizePythonImportRoot(importRoot) ?: return false
-        if (File(siteDir, root).exists() || File(siteDir, "$root.py").isFile) {
-            return true
-        }
-        return siteDir.listFiles()?.any { file ->
-            file.isFile && file.name.startsWith("$root.")
-        } == true
-    }
-
     private fun removeLinuxLikeDistributionFiles(distribution: LinuxLikeDistribution) {
         distribution.recordEntries.forEach { relativePath ->
             deleteLinuxLikeSitePath(relativePath)
@@ -934,7 +882,10 @@ class LinuxLikePackageController(
             .toSet()
         return installed.keys
             .filter { name ->
-                !linuxLikeBootstrapPackages.contains(name) &&
+                // Only distributions with dist-info metadata have a dependency graph we can
+                // trust; loose directories/files are never treated as removable orphans.
+                installed[name]?.isMetadataBacked() == true &&
+                    !linuxLikeBootstrapPackages.contains(name) &&
                     !explicit.contains(name) &&
                     !required.contains(name)
             }

@@ -15,6 +15,8 @@ import java.nio.file.Files
 import java.nio.file.Paths
 import java.security.MessageDigest
 import java.util.Locale
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.zip.GZIPInputStream
 
 class LinuxLikeRuntimeManager(private val context: Context) {
@@ -24,6 +26,9 @@ class LinuxLikeRuntimeManager(private val context: Context) {
         const val defaultRuntimeFlavor = "debian-python-dev-aarch64"
         const val stdinRequestSentinel = "__PYRUNNER_STDIN_REQUEST__"
         const val defaultScriptWorkingDir = "/storage/emulated/0/Download/PythonRunner"
+
+        /** SharedPreferences key (Flutter `shared_preferences` stores bool values under "flutter."). */
+        const val prootCompatModePrefKey = "flutter.debian_proot_compat_mode"
     }
 
     private val runtimeDir: File = File(context.filesDir, "linux_like")
@@ -47,6 +52,19 @@ class LinuxLikeRuntimeManager(private val context: Context) {
     private val fallbackDnsServers = listOf("1.1.1.1", "8.8.8.8")
     private val dynamicLoaderGuestPath = "/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"
     private val dynamicLibraryGuestPath = "/usr/lib/aarch64-linux-gnu:/lib/aarch64-linux-gnu:/usr/lib:/lib"
+
+    /**
+     * Compatibility mode = run proot with PROOT_NO_SECCOMP=1. On the HarmonyOS test device
+     * getcwd/chdir/readlink fail with ENOSYS under proot's seccomp acceleration (bundled proot
+     * 5.1.0, and also the proot used by another app), while they work without it. Default on.
+     */
+    val prootCompatMode: Boolean
+        get() = try {
+            context.getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+                .getBoolean(prootCompatModePrefKey, true)
+        } catch (_: Exception) {
+            true
+        }
 
     val userSitePackageGuestPaths: List<String>
         get() = listOf(
@@ -219,6 +237,7 @@ class LinuxLikeRuntimeManager(private val context: Context) {
             "nativeLinuxLikeLoaderPath" to nativeLinuxLikeLoaderPath,
             "nativeLinuxLikeLoaderGuestPath" to nativeLinuxLikeLoaderGuestPath,
             "prootSource" to if (prootPath == nativeProotPath) "apk_native" else "runtime_package",
+            "prootCompatMode" to prootCompatMode.toString(),
             "pythonPath" to pythonPath,
             "pipPath" to pipPath,
             "archivePath" to archiveFile.absolutePath,
@@ -238,6 +257,7 @@ class LinuxLikeRuntimeManager(private val context: Context) {
             "architecture" to (Build.SUPPORTED_ABIS.firstOrNull() ?: Build.CPU_ABI ?: "unknown")
         ).apply {
             putAll(marker)
+            putAll(lastSelfCheck)
         }
     }
 
@@ -246,6 +266,9 @@ class LinuxLikeRuntimeManager(private val context: Context) {
         repairCriticalExecutablePermissions()
         return getInfo().toMutableMap().apply {
             this["prepared"] = "true"
+            if (this["available"] == "true") {
+                putAll(runGuestSelfCheck(force = false))
+            }
         }
     }
 
@@ -287,6 +310,9 @@ class LinuxLikeRuntimeManager(private val context: Context) {
             getInfo().toMutableMap().apply {
                 this["installedFrom"] = selectedManifestUrl
                 this["message"] = this["message"] ?: "Debian runtime installed"
+                if (this["available"] == "true") {
+                    putAll(runGuestSelfCheck(force = true))
+                }
             }
         } finally {
             cleanupDownloadedArchive()
@@ -301,7 +327,8 @@ class LinuxLikeRuntimeManager(private val context: Context) {
     ): List<String> {
         return buildBaseCommand(
             resolveScriptWorkingDir(workingDir),
-            ensureWorkingDirExists = true
+            ensureWorkingDirExists = true,
+            environment = environment
         ).apply {
             addPythonLauncherWithHook(scriptPath, executionFilePath)
         }
@@ -313,7 +340,7 @@ class LinuxLikeRuntimeManager(private val context: Context) {
         workingDir: String? = null,
         environment: Map<String, String>? = null
     ): List<String> {
-        return buildBaseCommand(workingDir).apply {
+        return buildBaseCommand(workingDir, environment = environment).apply {
             addPythonLauncher()
             add("-m")
             add(moduleName)
@@ -323,12 +350,24 @@ class LinuxLikeRuntimeManager(private val context: Context) {
 
     fun buildPythonInlineCommand(
         code: String,
-        workingDir: String? = null
+        workingDir: String? = null,
+        environment: Map<String, String>? = null
     ): List<String> {
-        return buildBaseCommand(workingDir).apply {
+        return buildBaseCommand(workingDir, environment = environment).apply {
             addPythonLauncher()
             add("-c")
             add(code)
+        }
+    }
+
+    /** Runs an arbitrary guest executable (e.g. `/bin/pwd -P`) through the same proot/env -i path. */
+    fun buildGuestExecCommand(
+        args: List<String>,
+        workingDir: String? = null,
+        environment: Map<String, String>? = null
+    ): List<String> {
+        return buildBaseCommand(workingDir, environment = environment).apply {
+            addAll(args)
         }
     }
 
@@ -339,7 +378,8 @@ class LinuxLikeRuntimeManager(private val context: Context) {
 
     private fun buildBaseCommand(
         workingDir: String? = null,
-        ensureWorkingDirExists: Boolean = false
+        ensureWorkingDirExists: Boolean = false,
+        environment: Map<String, String>? = null
     ): MutableList<String> {
         ensureDirectories()
         repairCriticalExecutablePermissions()
@@ -361,6 +401,9 @@ class LinuxLikeRuntimeManager(private val context: Context) {
         listOf("/sdcard", "/storage", "/mnt").forEach { path ->
             if (File(path).exists()) addBind(command, path)
         }
+        // Host /proc: numpy/scipy/psutil read /proc/cpuinfo, /proc/self/* etc.; the rootfs
+        // has no usable /proc of its own ("Can't read /proc/cpuinfo", readlink /proc/self/exe ENOENT).
+        if (File("/proc").isDirectory) addBind(command, "/proc")
         if (resolvedWorkingDir.startsWith("/")) {
             val hostWorkingDir = File(resolvedWorkingDir)
             if (ensureWorkingDirExists && !hostWorkingDir.exists()) {
@@ -372,7 +415,14 @@ class LinuxLikeRuntimeManager(private val context: Context) {
         }
         command.add("-w")
         command.add(resolvedWorkingDir)
+        // The guest must not inherit the host app environment (Chaquopy PYTHONPATH etc.):
+        // clear it with env -i and pass only the allow-list plus the caller's variables.
+        command.addAll(GuestEnvironment.envCommand(guestEnvironment(environment)))
         return command
+    }
+
+    internal fun guestEnvironment(environment: Map<String, String>?): Map<String, String> {
+        return GuestEnvironment.build(environment, userSitePackageGuestPaths)
     }
 
     private fun MutableList<String>.addPythonLauncher() {
@@ -470,12 +520,22 @@ class LinuxLikeRuntimeManager(private val context: Context) {
         }
     }
 
+    /**
+     * Prepares the environment of the *proot* process only. Everything the guest sees is
+     * decided by [guestEnvironment] and baked into the command (`/usr/bin/env -i ...`), so
+     * [environment] is accepted for source compatibility but is already part of the command.
+     * LD_LIBRARY_PATH and PROOT_* are set here and never reach the guest.
+     *
+     * [seccompCompat] = true sets PROOT_NO_SECCOMP=1 (see [prootCompatMode]); false removes it.
+     */
     fun applyHostEnvironment(
         target: MutableMap<String, String>,
-        environment: Map<String, String>? = null
+        @Suppress("UNUSED_PARAMETER") environment: Map<String, String>? = null,
+        seccompCompat: Boolean = prootCompatMode
     ) {
         ensureDirectories()
         val executionTempDir = createProotTempDir()
+        GuestEnvironment.scrubHostEnvironment(target)
         val existingLdPath = target["LD_LIBRARY_PATH"]?.takeIf { it.isNotBlank() }
         val runtimeLibDir = File(prootSupportDir, "usr/lib").absolutePath
         target["LD_LIBRARY_PATH"] = listOf(
@@ -489,30 +549,169 @@ class LinuxLikeRuntimeManager(private val context: Context) {
         if (File(prootLoader32Path).isFile) {
             target["PROOT_LOADER_32"] = prootLoader32Path
         }
-        target["HOME"] = "/root"
-        target["USER"] = "root"
-        target["LOGNAME"] = "root"
-        target["SHELL"] = "/bin/sh"
-        target["TERM"] = "xterm-256color"
-        target["PATH"] =
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-        target["LANG"] = "C.UTF-8"
-        target["PIP_NO_INPUT"] = "1"
-        target["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
-        target["PIP_ROOT_USER_ACTION"] = "ignore"
-        environment?.forEach { (key, value) ->
-            target[key] = value
-        }
-        target["PYTHONDONTWRITEBYTECODE"] = "1"
-        val pycacheDir = File(executionTempDir, "pycache")
-        if (!pycacheDir.exists()) pycacheDir.mkdirs()
-        target["PYTHONPYCACHEPREFIX"] = pycacheDir.absolutePath
-        val existingPythonPath = target["PYTHONPATH"]?.takeIf { it.isNotBlank() }
-        target["PYTHONPATH"] = (userSitePackageGuestPaths + listOfNotNull(existingPythonPath))
-            .distinct()
-            .joinToString(":")
         target["PROOT_TMP_DIR"] = executionTempDir.absolutePath
         target["TMPDIR"] = executionTempDir.absolutePath
+        if (seccompCompat) {
+            target["PROOT_NO_SECCOMP"] = "1"
+        } else {
+            target.remove("PROOT_NO_SECCOMP")
+        }
+    }
+
+    private val selfCheckDone = AtomicBoolean(false)
+
+    @Volatile
+    private var lastSelfCheck: Map<String, String> = emptyMap()
+
+    private val selfCheckLogFile: File
+        get() = File(File(runtimeDir, "logs"), "guest-selfcheck.log")
+
+    private class ProbeResult(
+        val name: String,
+        val ok: Boolean,
+        val exitCode: Int,
+        val output: String,
+        val error: String?,
+        val commandLine: String
+    ) {
+        val summary: String
+            get() = "probe[$name] ${if (ok) "OK" else "FAILED"} exit=$exitCode" +
+                (error?.let { " error=$it" } ?: "")
+    }
+
+    /**
+     * Runs one probe process. [buildCommand] produces the full command (proot + guest side);
+     * [seccompCompat] decides PROOT_NO_SECCOMP on the proot process. Stdout and stderr are
+     * captured together.
+     */
+    private fun runProbe(
+        name: String,
+        seccompCompat: Boolean,
+        buildCommand: () -> List<String>
+    ): ProbeResult {
+        var exitCode = -1
+        var output = ""
+        var error: String? = null
+        var commandLine = ""
+        val outputFile = File.createTempFile("guest-selfcheck-", ".txt", context.cacheDir)
+        var tempDir: String? = null
+        try {
+            val command = buildCommand()
+            commandLine = command.joinToString(" ")
+            val builder = ProcessBuilder(command)
+            builder.redirectErrorStream(true)
+            applyHostEnvironment(builder.environment(), null, seccompCompat)
+            tempDir = builder.environment()["PROOT_TMP_DIR"]
+            builder.redirectOutput(outputFile)
+            val process = builder.start()
+            if (!process.waitFor(20, TimeUnit.SECONDS)) {
+                process.destroyForcibly()
+                process.waitFor()
+                error = "timeout after 20s"
+            } else {
+                exitCode = process.exitValue()
+            }
+            output = outputFile.readText().trim().takeLast(4000)
+        } catch (e: Exception) {
+            error = "${e.javaClass.simpleName}: ${e.message}"
+        } finally {
+            outputFile.delete()
+            cleanupExecutionTempDir(tempDir)
+        }
+        return ProbeResult(name, error == null && exitCode == 0, exitCode, output, error, commandLine)
+    }
+
+    /**
+     * Guest self-check; every probe goes through the same proot/env -i path as real runs.
+     *  - proot-version: `proot --version` (which proot build is actually in use)
+     *  - import: `python3 -c "import sys,encodings;print(sys.version,sys.path)"` with the
+     *    currently configured mode ([prootCompatMode]); this is the real-world check
+     *  - syscalls-seccomp / syscalls-compat: Python with PYTHONSAFEPATH=1 (so the import
+     *    system does not call getcwd) that calls getcwd, readlink, stat and chdir one by one
+     *    and prints each result or error; seccomp acceleration on vs. PROOT_NO_SECCOMP=1
+     *  - pwd-seccomp / pwd-compat: `/bin/pwd -P` (no Python involved), same two modes
+     * `selfCheck` reflects the `import` probe. Everything also lands in Logcat (tag LinuxLike),
+     * [selfCheckLogFile] and the getInfo() map (selfCheckProbes, selfCheckProbe_*).
+     * With [force] = false it runs once per app process.
+     */
+    fun runGuestSelfCheck(force: Boolean = true): Map<String, String> {
+        if (!force && !selfCheckDone.compareAndSet(false, true)) {
+            return mapOf("selfCheck" to "skipped")
+        }
+        val importCode = "import sys,encodings;print(sys.version,sys.path)"
+        val syscallCode = "import os\n" +
+            "def t(name, fn):\n" +
+            "    try:\n" +
+            "        print(name, 'ok', repr(fn()))\n" +
+            "    except BaseException as e:\n" +
+            "        print(name, 'FAIL', repr(e))\n" +
+            "t('getcwd', os.getcwd)\n" +
+            "t('readlink /proc/self/cwd', lambda: os.readlink('/proc/self/cwd'))\n" +
+            "t('readlink /proc/self/exe', lambda: os.readlink('/proc/self/exe'))\n" +
+            "t('stat .', lambda: os.stat('.').st_ino)\n" +
+            "t('chdir /', lambda: os.chdir('/'))\n" +
+            "t('getcwd after chdir', os.getcwd)\n"
+        val safePath = mapOf("PYTHONSAFEPATH" to "1")
+        val configuredCompat = prootCompatMode
+        val probes = listOf(
+            runProbe("proot-version", configuredCompat) { listOf(prootPath, "--version") },
+            runProbe("import", configuredCompat) { buildPythonInlineCommand(importCode) },
+            runProbe("syscalls-seccomp", false) {
+                buildPythonInlineCommand(syscallCode, environment = safePath)
+            },
+            runProbe("syscalls-compat", true) {
+                buildPythonInlineCommand(syscallCode, environment = safePath)
+            },
+            runProbe("pwd-seccomp", false) { buildGuestExecCommand(listOf("/bin/pwd", "-P")) },
+            runProbe("pwd-compat", true) { buildGuestExecCommand(listOf("/bin/pwd", "-P")) }
+        )
+        probes.forEach { probe ->
+            if (probe.ok) {
+                android.util.Log.i("LinuxLike", "${probe.summary}\n${probe.output}")
+            } else {
+                android.util.Log.w("LinuxLike", "${probe.summary}\n${probe.output}")
+            }
+        }
+        appendSelfCheckLog(probes)
+        val import = probes.first { it.name == "import" }
+        val result = linkedMapOf(
+            "selfCheck" to if (import.ok) "ok" else "failed",
+            "selfCheckCompatMode" to configuredCompat.toString(),
+            "selfCheckExitCode" to import.exitCode.toString(),
+            "selfCheckOutput" to import.output,
+            "selfCheckLog" to selfCheckLogFile.absolutePath,
+            "selfCheckProbes" to probes.joinToString("; ") {
+                "${it.name}=${if (it.ok) "ok" else "failed"}"
+            }
+        )
+        probes.filter { it.name != "import" }.forEach { probe ->
+            result["selfCheckProbe_${probe.name.replace('-', '_')}"] =
+                "exit=${probe.exitCode}" + (probe.error?.let { " error=$it" } ?: "") +
+                    "\n" + probe.output.takeLast(1500)
+        }
+        lastSelfCheck = result
+        return result
+    }
+
+    private fun appendSelfCheckLog(probes: List<ProbeResult>) {
+        try {
+            val file = selfCheckLogFile
+            file.parentFile?.mkdirs()
+            if (file.length() > 64 * 1024) {
+                val tail = file.readText().takeLast(32 * 1024)
+                file.writeText(tail)
+            }
+            val stamp = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+                .format(java.util.Date())
+            file.appendText(buildString {
+                probes.forEach { probe ->
+                    append("[$stamp] ${probe.summary}\n")
+                    append("command: ${probe.commandLine}\n")
+                    append("output:\n${probe.output}\n\n")
+                }
+            })
+        } catch (_: Exception) {
+        }
     }
 
     fun cleanupExecutionTempDir(path: String?) {

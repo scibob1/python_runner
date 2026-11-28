@@ -4,6 +4,8 @@ import 'package:python_runner/features/mcp/application/mcp_terminal_service.dart
 import 'package:python_runner/features/mcp/domain/mcp_error_codes.dart';
 import 'package:python_runner/features/mcp/domain/mcp_permission.dart';
 import 'package:python_runner/features/mcp/infrastructure/mcp_terminal_tools.dart';
+import 'package:python_runner/features/ssh/application/terminal/session_manager.dart';
+import 'package:python_runner/features/ssh/application/terminal/terminal_session.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../support/mcp_test_helper.dart';
@@ -132,6 +134,64 @@ void main() {
     expect(service.attention.single.kind, 'terminal');
     service.clearAttention('terminal', 'local-1');
     expect(service.attention, isEmpty);
+  });
+
+  test('the open tool offers local and Debian shells, not SSH', () {
+    final registry = McpTerminalToolRegistry(
+      FakeMcpApplicationFacade(),
+      terminal: newService(),
+    );
+    final schema = registry.find('pyrunner_terminal_open')!.definition.inputSchema;
+    final properties = schema['properties'] as Map<String, dynamic>;
+    final kind = properties['kind'] as Map<String, dynamic>;
+    expect(kind['enum'], <String>['local', 'debian']);
+    expect(schema['required'], isNull);
+  });
+
+  test('opening a session of another kind is refused', () async {
+    final service = newService();
+    await expectLater(
+      service.openSession(kind: 'ssh'),
+      throwsA(
+        isA<McpToolException>()
+            .having((e) => e.code, 'code', McpErrorCodes.invalidArgument),
+      ),
+    );
+    expect(TerminalSessionManager.instance.sessions, isEmpty);
+  });
+
+  test('a Debian shell that cannot start is reported and not left behind',
+      () async {
+    final service = newService();
+    // No native side in a unit test: preparing the shell fails.
+    await expectLater(
+      service.openSession(kind: 'debian'),
+      throwsA(
+        isA<McpToolException>()
+            .having((e) => e.code, 'code', 'TERMINAL_START_FAILED'),
+      ),
+    );
+    expect(TerminalSessionManager.instance.sessions, isEmpty);
+  });
+
+  test('every kind of session tells the AI where it runs', () {
+    final manager = TerminalSessionManager.instance;
+    final sessions = <TerminalSession>[
+      manager.createLocal(),
+      manager.createDebian(),
+    ];
+    addTearDown(() async {
+      for (final session in sessions) {
+        await manager.remove(session.id);
+      }
+    });
+    final byKind = <String, String>{
+      for (final session in sessions)
+        session.kind: McpTerminalService.environmentOf(session),
+    };
+    expect(byKind['local'], contains('Android sh'));
+    expect(byKind['local'], contains('cannot see files inside the Debian guest'));
+    expect(byKind['debian'], contains('/python-runner/site-packages'));
   });
 
   test('notices from the app are not messages from the user', () async {

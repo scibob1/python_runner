@@ -17,6 +17,16 @@ jobs:
           python3 -m unittest discover -s test -p repository_hygiene_test.py
           python3 scripts/check_repo_hygiene.py
 
+      # Host-side tests of the Chaquopy Python sources (pip staging, script_runner pip
+      # helpers). Needs pip: PipPatchTest imports pip._internal.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Python unit tests (android/app/src/test/python)
+        working-directory: android/app/src/test/python
+        run: python -m unittest -v
+
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
@@ -53,6 +63,12 @@ jobs:
 
       - name: Build debug APK
         run: flutter build apk --debug
+
+      # Only the app module: plugin modules (e.g. url_launcher_android) ship Robolectric
+      # tests that need Java 21 and are not ours to gate on.
+      - name: Android (Kotlin) unit tests
+        working-directory: android
+        run: ./gradlew :app:testDebugUnitTest --console=plain
 
       - name: Create CI release signing key
         run: |

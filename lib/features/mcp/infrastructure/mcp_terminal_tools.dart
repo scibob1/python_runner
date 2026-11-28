@@ -78,7 +78,7 @@ class McpTerminalToolRegistry extends McpToolRegistry {
         definition: McpToolDefinition(
           name: 'pyrunner_terminal_list',
           description:
-              'List the open terminal sessions (local shells and SSH) with id, status, output_cursor and whether you opened them. A session with needs_user_input=true is waiting for the user to type a password. Use pyrunner_terminal_open for a new local shell.',
+              'List the open terminal sessions (kind local = Android sh, debian = bash in the Debian guest, ssh = remote) with id, kind, environment, status, output_cursor and whether you opened them. A session with needs_user_input=true is waiting for the user to type a password. Use pyrunner_terminal_open for a new local or Debian shell.',
           permission: McpPermission.terminal,
           inputSchema: _obj(const <String, dynamic>{}),
         ),
@@ -89,15 +89,22 @@ class McpTerminalToolRegistry extends McpToolRegistry {
         definition: McpToolDefinition(
           name: 'pyrunner_terminal_open',
           description:
-              'Open a new local shell session (Android sh). It appears as a tab in the app so the user can watch and type into it too. The built-in commands python, run, scripts and pyhelp only work while the user has the Terminal page open in the app (their output shows in a run console); otherwise they answer with a message saying so. SSH sessions must be opened by the user.',
+              'Open a new shell session. kind=local (default) is Android sh on the phone: it cannot see files inside the Debian guest, and its built-in commands python, run, scripts and pyhelp only work while the user has the Terminal page open in the app (their output shows in a run console). kind=debian is bash inside the Debian guest (proot): python3, pip and apt work, and /python-runner/site-packages is the package directory scripts use; it needs the Debian runtime to be installed. Neither has a PTY, so full-screen programs such as vim or top do not work. The session appears as a tab in the app so the user can watch and type into it too. SSH sessions must be opened by the user.',
           permission: McpPermission.terminal,
           inputSchema: _obj(<String, dynamic>{
+            'kind': <String, dynamic>{
+              'type': 'string',
+              'enum': <String>['local', 'debian'],
+              'description':
+                  'local = Android sh (default), debian = bash in the Debian guest',
+            },
             'title': _str('Short name for the tab (optional)'),
           }),
         ),
         timeout: const Duration(seconds: 60),
         handler: (context, args) async =>
-            McpToolResult.success(await _terminal.openLocal(
+            McpToolResult.success(await _terminal.openSession(
+          kind: optionalString(args, 'kind', max: 16) ?? 'local',
           title: optionalString(args, 'title', max: 80),
         )),
       ),

@@ -488,9 +488,10 @@ class ExecutionProvider extends ChangeNotifier {
     final prefs = await SharedPreferences.getInstance();
     return _ExecutionPreferences(
       workingDir: includeWorkingDir ? prefs.getString('working_dir') : null,
-      // Keep execution behavior aligned with the settings UI on a fresh
-      // install. A persisted zero still explicitly means no timeout.
-      timeoutSeconds: prefs.getInt('execution_timeout') ?? 60,
+      // No limit unless the person set one in Settings: a default limit
+      // silently killed long computations on a fresh install. Zero (and a
+      // missing value) both mean no timeout.
+      timeoutSeconds: prefs.getInt('execution_timeout') ?? 0,
       preferredRuntimeBackendId: RuntimeManager.normalizePreferredBackendId(
         prefs.getString(RuntimeManager.prefsKey),
       ),

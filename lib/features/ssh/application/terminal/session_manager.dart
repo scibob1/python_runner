@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart';
 
 import '../../domain/ssh_profile.dart';
+import 'debian_shell_session.dart';
 import 'local_shell_session.dart';
 import 'ssh_session.dart';
 import 'terminal_session.dart';
@@ -49,6 +50,12 @@ class TerminalSessionManager extends ChangeNotifier {
     _makeRoom();
     final n = ++_counter;
     return _add(LocalShellSession(id: 'local-$n', title: 'Shell $n'));
+  }
+
+  DebianShellSession createDebian() {
+    _makeRoom();
+    final n = ++_counter;
+    return _add(DebianShellSession(id: 'debian-$n', title: 'Debian $n'));
   }
 
   SshSession createSsh(SshProfile profile, {SshRemoteTask? task}) {

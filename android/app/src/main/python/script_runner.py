@@ -9,6 +9,8 @@ import queue as _queue_mod
 import gc
 import warnings
 
+import pip_staging
+
 
 _APP_DATA_DIR = None
 _DEFAULT_APP_DATA_DIR = "/data/data/com.daozhang.py"
@@ -192,7 +194,19 @@ def last_pip_error(max_lines=12):
     """Short human-readable reason for the last failed pip run."""
     if _LAST_PIP_OUTPUT.startswith("该包没有适用于"):
         head, _, tail = _LAST_PIP_OUTPUT.partition("\n可改用")
-        hint = head + "\n可改用" + tail.split("\n", 1)[0]
+        hint_tail, _, rest = tail.partition("\n")
+        hint = head + "\n可改用" + hint_tail
+        conflict = _conflict_block(rest)
+        if conflict:
+            budget = 1500 - len(hint) - 1
+            kept = []
+            for line in conflict.split("\n"):
+                budget -= len(line) + 1
+                if budget < 0:
+                    break
+                kept.append(line)
+            if kept:
+                hint += "\n" + "\n".join(kept)
         return hint[-1500:]
     lines = [l.strip() for l in _LAST_PIP_OUTPUT.splitlines() if l.strip()]
     errs = [l for l in lines if "ERROR" in l or "Error" in l or "error:" in l]
@@ -204,8 +218,38 @@ _NATIVE_HINT = (
     "该包没有适用于 Python %d.%d / Android 的预编译版本，且手机上无法编译源码。\n"
     "Chaquopy 官方仓库的 scipy / scikit-learn 只有 Python 3.8-3.10 的旧版本；"
     "TensorFlow / PyTorch 没有 Android 版。\n"
-    "可改用 Linux-like 运行时安装，或使用 Python 3.10 版本的构建（构建时设置环境变量 PYRUNNER_PYTHON=3.10）。"
+    "可改用 Debian 运行时安装（在 Debian 运行时的软件包页面安装，或在 Debian 终端里执行 pip install），"
+    "或使用 Python 3.10 版本的构建（构建时设置环境变量 PYRUNNER_PYTHON=3.10）。"
 )
+
+_NO_MATCH_MARKERS = ("No matching distribution", "Could not find a version")
+_CONFLICT_MARKERS = ("ResolutionImpossible", "conflicting dependencies")
+
+
+def _is_no_native_failure(out):
+    """pip could not find / combine prebuilt versions: no native package for this platform."""
+    return any(m in out for m in _NO_MATCH_MARKERS + _CONFLICT_MARKERS)
+
+
+def _conflict_block(out, max_lines=8, max_len=160):
+    """The 'The conflict is caused by:' lines of a pip resolver failure ('' if none)."""
+    lines = out.splitlines()
+    start = next((i for i, l in enumerate(lines) if "The conflict is caused by" in l), None)
+    if start is None:
+        return ""
+    block = [lines[start].strip()]
+    for line in lines[start + 1:]:
+        text = line.strip()
+        if not text:
+            if len(block) > 1:
+                break
+            continue
+        if text.startswith(("To fix this you could try", "Additionally,", "ERROR:")):
+            break
+        block.append(text[:max_len])
+        if len(block) > max_lines:
+            break
+    return "\n".join(block)
 
 
 def _run_install_with_fallback(full_args):
@@ -222,14 +266,17 @@ def _run_install_with_fallback(full_args):
     if rc == 0:
         return 0
     first = _LAST_PIP_OUTPUT
-    if "No matching distribution" not in first and "Could not find a version" not in first:
+    if not _is_no_native_failure(first):
         return rc  # failed for another reason (network, permissions, ...): keep that message
     rc = _run_pip(full_args)
     if rc != 0:
         out = _LAST_PIP_OUTPUT
-        if "build dependencies" in out or "Failed to build" in out or "No matching distribution" in out:
-            _LAST_PIP_OUTPUT = (_NATIVE_HINT % (sys.version_info[0], sys.version_info[1])
-                                + "\n" + out)
+        if "build dependencies" in out or "Failed to build" in out or _is_no_native_failure(out):
+            hint = _NATIVE_HINT % (sys.version_info[0], sys.version_info[1])
+            earlier = _conflict_block(first)
+            if earlier and not _conflict_block(out):
+                hint += "\n" + earlier  # keep the resolver's reason from the binary-only run
+            _LAST_PIP_OUTPUT = hint + "\n" + out
     return rc
 
 
@@ -319,35 +366,71 @@ def _find_missing_native_deps(site_dir):
 
 
 def _install_native_provider(package, site_dir):
-    """Install a provider wheel into a temp dir and merge it into site_dir.
+    """Install a provider wheel into a staging dir and merge it into site_dir.
 
     pip --target skips top-level dirs that already exist (e.g. the shared
-    'chaquopy/' dir), so merge the files ourselves.
+    'chaquopy/' dir), so the merge is done by pip_staging, which merges shared dirs
+    file by file and rolls everything back if the merge fails half-way.
     """
-    import shutil
-    import tempfile
     global _LAST_PIP_OUTPUT
     saved = _LAST_PIP_OUTPUT
-    tmp = tempfile.mkdtemp(prefix="pipdep_", dir=os.path.dirname(site_dir))
     try:
-        args = ["install", package, "--no-deps", "--prefer-binary", "--only-binary=:all:"]
-        for index in _CHAQUOPY_INDEXES:
-            args += ["--extra-index-url", index]
-        args += ["--target", tmp]
-        if _run_pip(args) != 0:
-            return False
-        for root, _dirs, files in os.walk(tmp):
-            rel = os.path.relpath(root, tmp)
-            dest_dir = site_dir if rel == "." else os.path.join(site_dir, rel)
-            os.makedirs(dest_dir, exist_ok=True)
-            for name in files:
-                shutil.copy2(os.path.join(root, name), os.path.join(dest_dir, name))
+        with pip_staging.staging_dir(site_dir) as staging:
+            args = ["install", package, "--no-deps", "--prefer-binary", "--only-binary=:all:"]
+            for index in _CHAQUOPY_INDEXES:
+                args += ["--extra-index-url", index]
+            args += ["--target", staging]
+            if _run_pip(args) != 0:
+                return False
+            pip_staging.merge_staging(staging, site_dir)
         return True
     except Exception:
         return False
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
         _LAST_PIP_OUTPUT = saved
+
+
+_UPGRADE_LONG_FLAGS = ("--upgrade", "--force-reinstall", "--ignore-installed")
+
+
+def _is_upgrade_request(args):
+    """True when the pip args ask to replace installed files (-U / -I / --force-reinstall).
+
+    Without such a flag an already installed package is left alone, like ``pip --target``.
+    ``--upgrade-strategy`` alone is not an upgrade request.
+    """
+    for arg in args:
+        arg = str(arg)
+        if arg in _UPGRADE_LONG_FLAGS:
+            return True
+        # short flags, possibly clustered (-U, -I, -Ur)
+        if re.match(r"^-[A-Za-z]+$", arg) and ("U" in arg or "I" in arg):
+            return True
+    return False
+
+
+def _install_via_staging(full_args, site_dir, upgrade):
+    """pip install into a fresh staging dir, then merge into site_dir (all or nothing).
+
+    A failed or interrupted pip run never touches site_dir, so it can no longer leave
+    half-installed packages behind that block the next install.
+    """
+    global _LAST_PIP_OUTPUT
+    with pip_staging.staging_dir(site_dir) as staging:
+        rc = _run_install_with_fallback(list(full_args) + ["--target", staging])
+        if rc != 0:
+            return rc
+        try:
+            result = pip_staging.merge_staging(staging, site_dir, upgrade=upgrade)
+        except Exception as exc:
+            message = "安装文件合并失败，已回滚，已安装的包未被改动: %s: %s" % (type(exc).__name__, exc)
+            print(message, file=sys.stderr)
+            _LAST_PIP_OUTPUT = message
+            return 1
+    kept = [n for n in result["skipped"] if not n.endswith((".dist-info", ".egg-info"))]
+    if kept:
+        print("提示: 以下已安装的项目未被替换（如需更新请加 --upgrade）: " + ", ".join(kept))
+    return 0
 
 
 def _fix_missing_native_deps(site_dir):
@@ -1180,7 +1263,8 @@ def install_package(args):
     before = _snap()
 
     full_args = list(args)
-    if full_args and full_args[0] == "install":
+    is_install = bool(full_args) and full_args[0] == "install"
+    if is_install:
         # C-extension packages (numpy/scipy/...) only exist as Android wheels on
         # Chaquopy's index; prefer them over newer source-only releases on PyPI.
         for _index in _CHAQUOPY_INDEXES:
@@ -1188,8 +1272,11 @@ def install_package(args):
                 full_args += ["--extra-index-url", _index]
         if "--prefer-binary" not in full_args:
             full_args.append("--prefer-binary")
-    full_args += ["--target", site_dir]
-    pip_result = _run_install_with_fallback(full_args)
+    if is_install:
+        pip_result = _install_via_staging(full_args, site_dir, _is_upgrade_request(full_args))
+    else:
+        full_args += ["--target", site_dir]
+        pip_result = _run_install_with_fallback(full_args)
     if pip_result == 0:
         try:
             _fix_missing_native_deps(site_dir)

@@ -13,6 +13,7 @@ import '../services/native_bridge.dart';
 import '../services/app_logger.dart';
 import '../services/app_update_manager.dart';
 import '../services/network_debug_config.dart';
+import '../services/runtime_keep_awake.dart';
 import '../services/request_override_config.dart';
 import '../runtime/runtime_manager.dart';
 import '../providers/execution_provider.dart';
@@ -33,6 +34,7 @@ import 'app_file_picker_page.dart';
 import 'request_override_editor_page.dart';
 
 part 'settings_actions.dart';
+part 'settings_keep_awake.dart';
 part 'settings_sections.dart';
 part 'settings_ssh.dart';
 part 'settings_widgets.dart';
@@ -53,7 +55,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   final _proxyHostController = TextEditingController();
   final _proxyPortController = TextEditingController();
   final _githubMirrorController = TextEditingController();
-  int _timeout = 60;
+  int _timeout = 0;
   bool _netDebugMode = false;
   bool _netAllowInsecure = false;
   bool _overrideEnabled = false;
@@ -87,11 +89,12 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
             delegate: SliverChildListDelegate(
               [
                     _buildAppearanceSection(),
-                    _buildScriptStorageSection(),
-                    _buildRuntimeSection(),
                     _buildSshSection(),
                     _buildNetworkDebugSection(),
+                    _buildScriptStorageSection(),
+                    _buildRuntimeSection(),
                     _buildDiagnosticsSection(),
+                    const _KeepAwakeCard(),
                     _buildAboutSection(),
                   ]
                   .map(

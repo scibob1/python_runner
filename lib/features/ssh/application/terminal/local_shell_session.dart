@@ -124,6 +124,12 @@ class LocalShellSession extends TerminalSession {
       ),
     );
     info(tr('启动目录：$dir', 'Start directory: $dir'));
+    info(
+      tr(
+        '这是 Android 自带的 sh，不是 Debian，看不到 /python-runner 等 Debian 里的文件。要进入 Debian，请点标签栏的 + 新建“Debian 终端”。',
+        "This is Android's own sh, not Debian, so Debian files such as /python-runner are not visible. To get into Debian, tap + in the tab bar and pick Debian terminal.",
+      ),
+    );
 
     try {
       final process = await Process.start(
@@ -233,7 +239,7 @@ class LocalShellSession extends TerminalSession {
         isPythonCommandName(first);
     if (!builtin) return false;
     if (first == 'pyhelp') {
-      _printHelp();
+      printHelp();
       return true;
     }
     final host = this.host;
@@ -310,7 +316,8 @@ class LocalShellSession extends TerminalSession {
     );
   }
 
-  void _printHelp() {
+  /// Prints the built-in command help into the terminal.
+  void printHelp() {
     final text = tr(
       '内置命令：\n'
           '  python | python3 | py [-c 代码 | -m 模块 | 文件] [参数...]\n'
